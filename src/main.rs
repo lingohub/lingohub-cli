@@ -12,38 +12,53 @@ mod prompt;
 mod transport;
 mod tui_app;
 
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
 use clap_complete::{Shell::Bash, aot::generate};
 use clap_i18n_richformatter::{ClapI18nRichFormatter, init_clap_rich_formatter_localizer};
-use cli::parse::{ApiAction, Cli, ColorMode, Commands};
+use cli::{
+    login::KeyOverride,
+    parse::{ApiAction, Cli, ColorMode, Commands},
+};
 use error::Error;
 use reqwest::Method;
 use transport::{ApiClient, RequestOptions};
 
 fn main() {
+    // Login and logout tell whether a key outside the user configuration is in use, so note
+    // whether the process environment had one before that configuration can add its own.
+    let environment_api_key = std::env::var_os(cli::login::API_KEY_VARIABLE).is_some();
     // Load only the user's trusted configuration, before runtime threads exist.
     // Working-directory .env files must not redirect a stored credential.
-    if let Some(home) = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
-    {
-        dotenvy::from_path(std::path::Path::new(&home).join(".lingohub")).ok();
+    if let Some(path) = cli::login::config_file() {
+        dotenvy::from_path(path).ok();
     }
     cli::upgrade::remove_replaced_binary();
-    run_cli();
+    run_cli(environment_api_key);
 }
 
 #[tokio::main]
-async fn run_cli() {
+async fn run_cli(environment_api_key: bool) {
     init_clap_rich_formatter_localizer();
-    let mut cli = Cli::try_parse().unwrap_or_else(|err| err.apply::<ClapI18nRichFormatter>().exit());
+    let matches = Cli::command()
+        .try_get_matches()
+        .unwrap_or_else(|err| err.apply::<ClapI18nRichFormatter>().exit());
+    let mut cli = Cli::from_arg_matches(&matches)
+        .map_err(|err| err.format(&mut Cli::command()))
+        .unwrap_or_else(|err| err.apply::<ClapI18nRichFormatter>().exit());
+    let key_override = if matches.value_source("api_key") == Some(ValueSource::CommandLine) {
+        Some(KeyOverride::Flag)
+    } else if environment_api_key {
+        Some(KeyOverride::Environment)
+    } else {
+        None
+    };
     colors::set_color_enabled(
         matches!(cli.color, ColorMode::Always),
         matches!(cli.color, ColorMode::Never),
     );
     let command = cli.command.take();
     let update_check = cli::upgrade::start(command.as_ref(), &cli);
-    let result = run(command, &cli).await;
+    let result = run(command, &cli, key_override).await;
     if let Err(error) = &result {
         if cli.json {
             eprintln!("{}", error.as_json());
@@ -57,11 +72,13 @@ async fn run_cli() {
     }
 }
 
-async fn run(command: Option<Commands>, cli: &Cli) -> Result<(), Error> {
+async fn run(command: Option<Commands>, cli: &Cli, key_override: Option<KeyOverride>) -> Result<(), Error> {
     let no_request = matches!(
         &command,
         None | Some(
             Commands::Completion { .. }
+                | Commands::Login { .. }
+                | Commands::Logout
                 | Commands::Tui
                 | Commands::Upgrade { .. }
                 | Commands::Api {
@@ -104,6 +121,10 @@ async fn run(command: Option<Commands>, cli: &Cli) -> Result<(), Error> {
             return Ok(());
         }
         Some(Commands::Upgrade { check }) => return cli::upgrade::run(check, cli).await,
+        Some(Commands::Login { name, no_browser }) => {
+            return cli::login::login(name, !no_browser, cli, key_override).await;
+        }
+        Some(Commands::Logout) => return cli::login::logout(cli, key_override).await,
         Some(Commands::Api {
             action: ApiAction::Operations,
         }) => {

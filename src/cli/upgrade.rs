@@ -635,7 +635,11 @@ fn calls_api(command: &Commands) -> bool {
             action,
             ApiAction::Operations | ApiAction::McpTools { .. } | ApiAction::McpServe { .. }
         ),
-        Commands::Tui | Commands::Completion { .. } | Commands::Upgrade { .. } => false,
+        Commands::Login { .. }
+        | Commands::Logout
+        | Commands::Tui
+        | Commands::Completion { .. }
+        | Commands::Upgrade { .. } => false,
     }
 }
 

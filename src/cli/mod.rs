@@ -3,6 +3,7 @@
 
 pub mod download;
 pub mod input;
+pub mod login;
 pub mod mcp_catalog;
 pub mod output;
 pub mod parse;
