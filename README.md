@@ -77,7 +77,8 @@ only prints the link. The CLI then stores a new personal API key as `LINGOHUB_AP
 `~/.lingohub`, readable only by you (mode 600 on macOS and Linux), and leaves every other line of
 that file unchanged. The key is named after the computer (`--name` replaces the host name), is
 valid for 90 days and can be revoked in the LingoHub app at any time; run `lingohub login` again
-for a new one. The key is never printed.
+for a new one. The key it replaces stays active, because it may be in use elsewhere: revoke it in
+the app if you no longer use it. The key is never printed.
 
 `lingohub logout` revokes the stored key and removes it from `~/.lingohub`. A key that is no
 longer valid is only removed, and so is a workspace-managed key, which a workspace administrator

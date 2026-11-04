@@ -7,7 +7,7 @@ use std::{
     net::TcpListener,
     process::{Command, Output, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -12469,6 +12469,11 @@ fn login_stores_the_confirmed_key_and_keeps_the_rest_of_the_user_config() {
         !stderr.contains("Warning"),
         "a stored key overrides nothing: {stderr}"
     );
+    // The replaced key is not revoked: it may be in use elsewhere.
+    assert!(
+        stderr.contains("Note: the API key stored before is still active."),
+        "{stderr}"
+    );
     let requests = stub.finish();
     assert_eq!(requests.len(), 3);
     assert_login_requests(&requests, "Test Laptop");
@@ -12617,6 +12622,77 @@ fn login_expires_after_the_announced_time() {
     assert!(started.elapsed() >= Duration::from_secs(1));
     assert_eq!(stub.finish().len(), 2);
     assert_eq!(home.read(), None);
+}
+
+#[test]
+fn login_waits_as_asked_after_rate_limits_and_after_slow_answers() {
+    let home = Home::new(None);
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&arrivals);
+    let stub = Stub::with_hook(
+        vec![
+            login_started(900, 1).into_bytes(),
+            response(
+                "429 Too Many Requests",
+                json!({"status": 429}),
+                "Retry-After: 2\r\n",
+            )
+            .into_bytes(),
+            login_pending().into_bytes(),
+            login_issued(json!("2027-02-02")).into_bytes(),
+        ],
+        move |_| {
+            let mut arrivals = recorded.lock().unwrap();
+            arrivals.push(Instant::now());
+            // The third answer is slow.
+            if arrivals.len() == 3 {
+                thread::sleep(Duration::from_millis(1500));
+            }
+        },
+    );
+    let out = login_command(
+        &stub.origin,
+        &home,
+        &["login", "--name", "Test Laptop", "--no-browser", "--json"],
+        &[],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_login_requests(&stub.finish(), "Test Laptop");
+    let arrivals = arrivals.lock().unwrap();
+    assert_eq!(arrivals.len(), 4);
+    // A rate limit is no refusal: polling goes on after the requested wait, not the interval.
+    assert!(arrivals[2] - arrivals[1] >= Duration::from_millis(1900));
+    // The interval counts from the slow answer, not from when the poll was due.
+    assert!(arrivals[3] - arrivals[2] >= Duration::from_millis(2400));
+    assert_eq!(home.read().unwrap(), format!("LINGOHUB_API_KEY={ISSUED_KEY}\n"));
+}
+
+/// A key the API creates could not be stored, so login stops before it starts.
+#[cfg(unix)]
+#[test]
+fn login_fails_before_any_request_when_the_config_cannot_be_written() {
+    let home = Home::new(Some("FOO=bar\n"));
+    set_mode(&home.0, 0o555);
+    // Root writes anyway, which leaves nothing to test.
+    let probe = home.0.join("probe");
+    if std::fs::write(&probe, "").is_ok() {
+        let _ = std::fs::remove_file(probe);
+        set_mode(&home.0, 0o755);
+        return;
+    }
+    let stub = Stub::new(vec![]);
+    let out = login_command(
+        &stub.origin,
+        &home,
+        &["login", "--name", "Test Laptop", "--no-browser"],
+        &[],
+    );
+    set_mode(&home.0, 0o755);
+    assert_eq!(out.status.code(), Some(1));
+    assert_error_contains(&out, "cannot write next to");
+    assert!(stub.finish().is_empty());
+    assert_eq!(home.read().unwrap(), "FOO=bar\n");
+    assert_eq!(home.entries(), [".lingohub"]);
 }
 
 #[test]
@@ -12839,6 +12915,33 @@ fn logout_keeps_the_stored_key_when_revocation_fails() {
     );
     assert_eq!(home.read().unwrap(), config);
     assert_eq!(home.entries(), [".lingohub"]);
+}
+
+#[test]
+fn logout_keeps_a_key_stored_while_it_ran() {
+    let home = Home::new(Some("FOO=bar\nLINGOHUB_API_KEY=stored-key\n"));
+    let config = home.config();
+    // Another login stores a new key while the old one is being revoked.
+    let stub = Stub::with_hook(
+        vec!["HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into()],
+        move |_| std::fs::write(&config, "FOO=bar\nLINGOHUB_API_KEY=newer-key\n").unwrap(),
+    );
+    let out = login_command(&stub.origin, &home, &["logout", "--json"], &[]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!({
+            "config_file": home.config().to_str().unwrap(),
+            "outcome": "revoked",
+            "revoked": true,
+            "removed": false,
+        })
+    );
+    assert_eq!(
+        header_values(&stub.finish()[0], "Authorization"),
+        ["Bearer stored-key"]
+    );
+    assert_eq!(home.read().unwrap(), "FOO=bar\nLINGOHUB_API_KEY=newer-key\n");
 }
 
 #[test]

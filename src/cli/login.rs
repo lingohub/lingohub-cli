@@ -16,7 +16,10 @@ use crate::{
     transport::{ApiClient, RequestOptions, api_origin, is_loopback, network_error},
 };
 use crossterm::style::Stylize;
-use reqwest::{Client, Method, Response, Url, header::ACCEPT};
+use reqwest::{
+    Client, Method, Response, Url,
+    header::{ACCEPT, HeaderMap, RETRY_AFTER},
+};
 use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
@@ -91,9 +94,10 @@ pub async fn login(
     key_override: Option<KeyOverride>,
 ) -> Result<(), Error> {
     let path = require_config_file()?;
-    // Fail before the API creates a key that could not be stored.
-    read_config(&path)?;
-    write_target(&path)?;
+    // Fail before the API creates a key that could not be stored. An unreadable assignment is
+    // replaced like any other, so it only goes unmentioned.
+    let previous_key = stored_api_key(&read_config(&path)?, &path).ok().flatten();
+    check_writable(&path)?;
     let name = match name {
         Some(name) => checked_name(&name)?,
         None => device_name(),
@@ -133,6 +137,11 @@ pub async fn login(
             printable(&issued.workspace_name),
             printable(&issued.api_key_name),
             path.display()
+        );
+    }
+    if previous_key.is_some_and(|previous| previous != issued.api_key) {
+        eprintln!(
+            "Note: the API key stored before is still active. Revoke it in the LingoHub app (API keys in your account) if you no longer use it."
         );
     }
     if let Some(key_override) = key_override {
@@ -302,7 +311,8 @@ fn browser_command(url: &str) -> Command {
 }
 
 /// Polls until the login is confirmed, finally refused, or expired. The secret travels only in
-/// the request body.
+/// the request body. Each poll waits the announced interval after the previous answer, so a slow
+/// answer never leads to polls in quick succession; a rate-limited poll waits as long as asked.
 async fn wait_for_key(
     client: &Client,
     base: &Url,
@@ -315,7 +325,6 @@ async fn wait_for_key(
     );
     let body = json!({"secret": started.secret});
     let deadline = begin + started.expires;
-    let mut next = begin;
     loop {
         let response = client
             .post(url.clone())
@@ -327,7 +336,7 @@ async fn wait_for_key(
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let received = read_bounded(response).await?;
-        match status {
+        let wait = match status {
             200 => {
                 return parse_issued(&received).ok_or_else(|| {
                     Error::Protocol(format!(
@@ -336,7 +345,9 @@ async fn wait_for_key(
                     ))
                 });
             }
-            202 => {}
+            202 => started.interval,
+            // Not an answer about the login: it may still be confirmed.
+            429 => retry_after(&headers).map_or(started.interval, |wait| wait.max(started.interval)),
             400..=499 => {
                 return Err(Error::Protocol(format!(
                     "The login was denied, expired or already used. {LOGIN_AGAIN}"
@@ -348,14 +359,27 @@ async fn wait_for_key(
                     "Waiting for the login confirmation returned HTTP {status}"
                 )));
             }
-        }
-        next += started.interval;
+        };
+        let next = Instant::now() + wait;
         if next >= deadline {
             sleep_until(deadline).await;
             return Err(Error::Protocol(format!("The login expired. {LOGIN_AGAIN}")));
         }
         sleep_until(next).await;
     }
+}
+
+/// A `Retry-After` in seconds, bounded like the poll interval. The HTTP-date form is not used by
+/// the API and falls back to the interval.
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let seconds = headers
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds.min(MAX_POLL_INTERVAL_SECONDS)))
 }
 
 fn parse_issued(body: &[u8]) -> Option<Issued> {
@@ -403,7 +427,7 @@ async fn read_bounded(mut response: Response) -> Result<Vec<u8>, Error> {
 
 fn store_key(path: &Path, issued: &Issued) -> Result<(), Error> {
     // Read again: the file may have changed while the user confirmed the login.
-    update_config(path, Some(&issued.api_key)).map_err(|error| {
+    update_config(path, &issued.api_key).map_err(|error| {
         Error::Io(io::Error::other(format!(
             "The API key \"{}\" was created, but could not be stored in {} ({}). Revoke it in LingoHub and {}",
             printable(&issued.api_key_name),
@@ -465,8 +489,9 @@ pub async fn logout(cli: &Cli, key_override: Option<KeyOverride>) -> Result<(), 
         Err(Error::Api { status: 403, .. }) => Revocation::WorkspaceManaged,
         Err(error) => return Err(error),
     };
-    // Read again: the file may have changed while the request ran.
-    update_config(&path, None).map_err(|error| {
+    // Read again: the file may have changed while the request ran. A key stored meanwhile (by
+    // another login or an edit) is not the one revoked here, so it stays.
+    let removed = remove_stored_key(&path, &key).map_err(|error| {
         Error::Io(io::Error::other(format!(
             "{} it could not be removed from {} ({})",
             if revocation == Revocation::Revoked {
@@ -478,25 +503,46 @@ pub async fn logout(cli: &Cli, key_override: Option<KeyOverride>) -> Result<(), 
             cause(&error)
         )))
     })?;
-    let (outcome, message) = match revocation {
-        Revocation::Revoked => (
+    let (outcome, message) = match (revocation, removed) {
+        (Revocation::Revoked, true) => (
             "revoked",
             format!(
                 "Signed out; the key was revoked and removed from {}.",
                 path.display()
             ),
         ),
-        Revocation::AlreadyInvalid => (
+        (Revocation::AlreadyInvalid, true) => (
             "already_invalid",
             format!(
                 "The stored key was no longer valid and has been removed from {}.",
                 path.display()
             ),
         ),
-        Revocation::WorkspaceManaged => (
+        (Revocation::WorkspaceManaged, true) => (
             "workspace_managed",
             format!(
                 "The stored key was removed from {}, but not revoked: it is managed by the workspace, and only a workspace administrator can revoke it.",
+                path.display()
+            ),
+        ),
+        (Revocation::Revoked, false) => (
+            "revoked",
+            format!(
+                "The key was revoked. {} now holds a different key, which was kept.",
+                path.display()
+            ),
+        ),
+        (Revocation::AlreadyInvalid, false) => (
+            "already_invalid",
+            format!(
+                "The key was no longer valid. {} now holds a different key, which was kept.",
+                path.display()
+            ),
+        ),
+        (Revocation::WorkspaceManaged, false) => (
+            "workspace_managed",
+            format!(
+                "The key was not revoked: it is managed by the workspace, and only a workspace administrator can revoke it. {} now holds a different key, which was kept.",
                 path.display()
             ),
         ),
@@ -507,7 +553,7 @@ pub async fn logout(cli: &Cli, key_override: Option<KeyOverride>) -> Result<(), 
                 "config_file": path.to_string_lossy(),
                 "outcome": outcome,
                 "revoked": revocation == Revocation::Revoked,
-                "removed": true,
+                "removed": removed,
             }),
             true,
         )?;
@@ -560,10 +606,35 @@ fn read_config(path: &Path) -> Result<String, Error> {
     }
 }
 
-/// Sets (`Some`) or removes (`None`) the stored key in the current file.
-fn update_config(path: &Path, key: Option<&str>) -> Result<(), Error> {
+/// Sets the stored key in the current file.
+fn update_config(path: &Path, key: &str) -> Result<(), Error> {
     let content = read_config(path)?;
-    write_config(&write_target(path)?, &with_api_key(&content, key)).map_err(Error::Io)
+    write_config(&write_target(path)?, &with_api_key(&content, Some(key))).map_err(Error::Io)
+}
+
+/// Removes the stored key if it is still `key`, and tells whether it did.
+fn remove_stored_key(path: &Path, key: &str) -> Result<bool, Error> {
+    let content = read_config(path)?;
+    if stored_api_key(&content, path)?.as_deref() != Some(key) {
+        return Ok(false);
+    }
+    write_config(&write_target(path)?, &with_api_key(&content, None)).map_err(Error::Io)?;
+    Ok(true)
+}
+
+/// Creates and removes a file where the configuration is replaced: a key the API creates must not
+/// be lost because its directory turns out not to be writable.
+fn check_writable(path: &Path) -> Result<(), Error> {
+    let target = write_target(path)?;
+    let (temporary, file) = create_temporary(&target).map_err(|error| {
+        Error::Io(io::Error::new(
+            error.kind(),
+            format!("cannot write next to {}: {error}", target.display()),
+        ))
+    })?;
+    drop(file);
+    let _ = fs::remove_file(temporary);
+    Ok(())
 }
 
 /// An error as the cause within another message, without a second `I/O error:` prefix.
@@ -592,6 +663,16 @@ fn write_target(path: &Path) -> Result<PathBuf, Error> {
 /// never sees half a file. The file is readable only by its owner on Unix, also when the
 /// replaced one was not.
 fn write_config(target: &Path, content: &str) -> io::Result<()> {
+    let (temporary, file) = create_temporary(target)?;
+    let written = fill(file, content).and_then(|()| fs::rename(&temporary, target));
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written
+}
+
+/// A new private file in the directory of `target`, which a rename can move onto it.
+fn create_temporary(target: &Path) -> io::Result<(PathBuf, File)> {
     let directory = target
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -601,7 +682,7 @@ fn write_config(target: &Path, content: &str) -> io::Result<()> {
         |name| name.to_string_lossy().into_owned(),
     );
     let mut attempt = 0;
-    let (temporary, file) = loop {
+    loop {
         let temporary = directory.join(format!("{name}.{}-{attempt}.tmp", std::process::id()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -611,16 +692,11 @@ fn write_config(target: &Path, content: &str) -> io::Result<()> {
             options.mode(0o600);
         }
         match options.open(&temporary) {
-            Ok(file) => break (temporary, file),
+            Ok(file) => return Ok((temporary, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempt < 32 => attempt += 1,
             Err(error) => return Err(error),
         }
-    };
-    let written = fill(file, content).and_then(|()| fs::rename(&temporary, target));
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
     }
-    written
 }
 
 fn fill(mut file: File, content: &str) -> io::Result<()> {
