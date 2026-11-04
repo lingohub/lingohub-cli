@@ -1,0 +1,39 @@
+# Copyright (c) 2026 lingohub GmbH and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+members = ["cargo:."]
+
+# Release configuration for dist; see docs/distribution.md. After a change, run
+# `dist generate` to update .github/workflows/v-release.yml.
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.34.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# A GitHub repo to push Homebrew formulas to
+tap = "lingohub/homebrew-cli"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax). Linux builds are static
+# (musl and rustls), so one binary runs on any distribution.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
+# The archive format to use for non-windows builds (defaults .tar.xz). gzip, because minimal
+# images such as Debian slim cannot extract xz.
+unix-archive = ".tar.gz"
+# Path that installers should place binaries in
+install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
+# Extra files for every archive; README, LICENSE and CHANGELOG are included automatically
+include = ["NOTICE"]
+# Only tags starting with "v" publish, so a tag ruleset on v* covers every release.
+tag-namespace = "v"
+# Whether to enable GitHub Attestations
+github-attestations = true
+# Whether to install an updater program
+install-updater = false
+
+# Build ARM64 Linux natively instead of cross-compiling the C TLS library.
+[dist.github-custom-runners]
+aarch64-unknown-linux-musl = "ubuntu-24.04-arm"

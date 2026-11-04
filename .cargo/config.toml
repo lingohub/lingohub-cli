@@ -1,0 +1,5 @@
+# Copyright (c) 2026 lingohub GmbH and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+
+[net]
+git-fetch-with-cli = true

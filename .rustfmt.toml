@@ -1,0 +1,9 @@
+# Copyright (c) 2026 lingohub GmbH and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+
+edition = "2024"
+# Stable rustfmt is shared by local commands and CI. Nightly-only layout options
+# are intentionally omitted; changing compiler channels is not required to format.
+max_width = 110
+merge_derives = true
+use_small_heuristics = "Default"

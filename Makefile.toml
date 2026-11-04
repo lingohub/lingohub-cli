@@ -1,0 +1,21 @@
+# Copyright (c) 2026 lingohub GmbH and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+
+[tasks.fmt]
+script = [
+    "cargo fmt --all"
+]
+
+[tasks.clean]
+command = "cargo"
+args = ["clean"]
+
+[tasks.build]
+command = "cargo"
+args = ["build"]
+
+[tasks.fmt-build]
+dependencies = ["fmt", "build"]
+
+[tasks.full-build]
+dependencies = ["clean", "fmt-build"]

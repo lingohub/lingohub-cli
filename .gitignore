@@ -1,0 +1,11 @@
+# Copyright (c) 2026 lingohub GmbH and/or its affiliates.
+# SPDX-License-Identifier: Apache-2.0
+
+# Rust compilation
+/target
+
+# Secret environment
+.env*
+
+# Python packaging checks
+__pycache__/

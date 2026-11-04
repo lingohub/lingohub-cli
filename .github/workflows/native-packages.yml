@@ -1,0 +1,91 @@
+name: Native builds
+# Every pull request is verified on one Linux runner, including the static Linux release build. The other
+# release platforms - two of them on macOS runners, which cost about ten times Linux per minute - are built
+# and tested only for a manual run or a pull request labelled native-packages for a platform-sensitive change
+# (the label takes effect with the next push, or start a manual run on the branch), to keep CI costs down.
+# Releases themselves are built by v-release.yml from a pushed v* tag.
+on:
+  pull_request:
+    # ready_for_review: drafts are skipped and verified once they leave draft.
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-builds-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --target x86_64-unknown-linux-musl
+      - name: Verify CLI and scripts
+        run: |
+          cargo fmt -- --check
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          python -m unittest discover -s scripts -p 'test_*.py'
+      - name: Build and smoke the static Linux release binary
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          cargo build --locked --profile dist --target x86_64-unknown-linux-musl
+          python scripts/smoke.py target/x86_64-unknown-linux-musl/dist/lingohub --static
+
+  native:
+    if: >-
+      ${{ github.event_name != 'pull_request'
+          || (!github.event.pull_request.draft
+              && contains(github.event.pull_request.labels.*.name, 'native-packages')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --target "$TARGET"
+      - name: Install musl tools
+        if: ${{ contains(matrix.target, 'musl') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Verify CLI and scripts
+        run: |
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          python -m unittest discover -s scripts -p 'test_*.py'
+      - name: Build and smoke the release binary
+        run: |
+          cargo build --locked --profile dist --target "$TARGET"
+          if [[ "$TARGET" == *-linux-musl ]]; then static=--static; else static=; fi
+          python scripts/smoke.py "target/$TARGET/dist/lingohub" $static

@@ -1,0 +1,4 @@
+# Copy this file to `$HOME/.lingohub` and fill in your own API key.
+# On Windows, `$USERPROFILE/.lingohub` is used when HOME is not set.
+# Working-directory and parent `.env` files are not read.
+LINGOHUB_API_KEY=lh-api_your_key_here
