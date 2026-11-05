@@ -237,10 +237,34 @@ async fn start(client: &Client, base: &Url, name: &str) -> Result<Started, Error
     match status {
         200 => parse_started(&body)
             .ok_or_else(|| Error::Protocol("The API returned an invalid login; no login was started".into())),
+        429 => Err(too_many_logins(Error::from_response(status, &body, &headers))),
         400.. => Err(Error::from_response(status, &body, &headers)),
         _ => Err(Error::Protocol(format!(
             "Starting the login returned HTTP {status}"
         ))),
+    }
+}
+
+/// Starting needs no credentials, so the API limits how many logins one network starts. Its answer
+/// does not say what to do about it; the problem does.
+fn too_many_logins(error: Error) -> Error {
+    match error {
+        Error::Api {
+            status,
+            request_id,
+            retry_after,
+            ..
+        } => Error::Api {
+            status,
+            problem: json!({
+                "title": "Too many logins were started from this network",
+                "detail": "Wait a minute, then run `lingohub login` again.",
+                "status": status
+            }),
+            request_id,
+            retry_after,
+        },
+        other => other,
     }
 }
 

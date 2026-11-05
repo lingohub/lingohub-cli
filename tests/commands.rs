@@ -12713,6 +12713,14 @@ fn login_rejects_failed_starts_and_unsafe_confirmation_links() {
             ),
             "HTTP 400: Bad Request\ndetail: name must not be blank",
         ),
+        (
+            response(
+                "429 Too Many Requests",
+                json!({"error": {"code": "client.authentication.rate_limit"}}),
+                "",
+            ),
+            "HTTP 429: Too many logins were started from this network\ndetail: Wait a minute, then run `lingohub login` again.",
+        ),
     ] {
         let home = Home::new(None);
         let stub = Stub::new(vec![reply]);
