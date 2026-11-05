@@ -1,11 +1,12 @@
 # V2 CLI operation inventory
 
-Backend revision: `5c21c84a002984fe3bb2354666e4b354d1a95b66`. This records addressability, not completed workflow tests.
+Backend revision: `fb1b7a081e08654185b437ec015a0bbbb0b04c71`. This records addressability, not completed workflow tests.
 
 Named-operation support does not establish a complete workflow; the [workflow cookbook](cookbook.md) shows complete examples. JSON operations support one-request `api call OPERATION --path NAME=VALUE --query NAME=VALUE`; resource commands also cover workspace and stack/project/style-guide CRUD. Multipart operations use `api upload OPERATION --upload PATH --form NAME=VALUE`; completed export artifacts use `api download-export EXPORT_ID --output PATH`, individual entries use `api download-export-entry EXPORT_ID ENTRY_ID --output PATH`, distribution releases use `api download-distribution-release RELEASE_ID --output PATH`; known async resources use `api wait OPERATION --path NAME=VALUE`; dedicated commands for other groups remain pending.
 
 | Operation | Method / path | CLI support |
 |---|---|---|
+| `deleteApiKey` | `DELETE /v2/api-key` | JSON operation call |
 | `getApiKey` | `GET /v2/api-key` | JSON operation call |
 | `listWorkspaceApiKeys` | `GET /v2/api-keys` | JSON operation call |
 | `createWorkspaceApiKey` | `POST /v2/api-keys` | JSON operation call |

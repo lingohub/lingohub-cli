@@ -322,14 +322,14 @@ mod tests {
                 .iter()
                 .all(|tool| tool["annotations"]["readOnlyHint"] == true)
         );
-        assert_eq!(315, first["available_operation_count"]);
+        assert_eq!(316, first["available_operation_count"]);
     }
 
     #[test]
     fn complete_inventory_accounts_for_every_operation_and_resolves_input_references() {
         let result = catalog(true, &[], &[]).unwrap();
         assert_eq!(
-            315,
+            316,
             result["tools"].as_array().unwrap().len() + result["unsupported"].as_array().unwrap().len()
         );
         for tool in result["tools"].as_array().unwrap() {
