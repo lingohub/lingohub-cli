@@ -9482,7 +9482,7 @@ fn mcp_catalog_is_offline_and_needs_no_credential_or_valid_origin() {
     let out = command("not a URL", &["--api-key", "", "api", "mcp-tools"], None);
     let catalog = success(&out);
     assert_eq!(catalog["selection"], "discovery");
-    assert_eq!(catalog["available_operation_count"], 315);
+    assert_eq!(catalog["available_operation_count"], 316);
     let tools = catalog["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 8);
     assert!(
@@ -9587,7 +9587,7 @@ fn mcp_catalog_accounts_for_all_operations_and_reports_upload_adapters() {
     let catalog = success(&command("not a URL", &["api", "mcp-tools", "--all"], None));
     let tools = catalog["tools"].as_array().unwrap();
     let unsupported = catalog["unsupported"].as_array().unwrap();
-    assert_eq!(tools.len() + unsupported.len(), 315);
+    assert_eq!(tools.len() + unsupported.len(), 316);
     assert!(unsupported.iter().any(|op| op["operation_id"] == "createImport"));
     assert!(
         tools
@@ -10675,7 +10675,7 @@ fn mcp_stdio_pages_the_selected_catalog_and_rejects_unknown_argument_groups() {
             break;
         }
     }
-    assert_eq!(names.len(), 312);
+    assert_eq!(names.len(), 313);
     assert!(
         mcp.call("tools/list", json!({"cursor":"invalid"}))
             .get("error")
