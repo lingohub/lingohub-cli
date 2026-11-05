@@ -18,7 +18,7 @@ use crate::colors::{BLUE_DARK, BLUE_LIGHT, GREY};
 const STACK_DETAIL_ROWS: usize = 7;
 
 /// Number of detail lines rendered beneath an expanded project row.
-const PROJECT_DETAIL_ROWS: usize = 6;
+const PROJECT_DETAIL_ROWS: usize = 5;
 
 /// A navigable row in the flattened tree.
 #[derive(Clone, Copy)]
@@ -442,7 +442,6 @@ fn render_lines(
                     let w = 12usize;
                     let details: [(&str, String); PROJECT_DETAIL_ROWS] = [
                         ("ID", proj.id.clone()),
-                        ("Open Source", proj.is_open_source.to_string()),
                         (
                             "Website",
                             proj.website.as_deref().unwrap_or("\u{2014}").to_owned(),
@@ -482,7 +481,7 @@ mod tests {
     #[test]
     fn dashboard_renders_current_stack_and_project_wire_models() {
         let stack: StackData = serde_json::from_value(json!({"id":"stack_a","name":"Current stack","color":"#123456","type":"PUBLIC","character_count":null,"word_count":42,"counts_updated_at":"2026-09-29T00:00:00.123Z","created_at":"2026-09-29T00:00:00.123Z","updated_at":"2026-09-29T00:00:00.123Z"})).unwrap();
-        let project: ProjectData = serde_json::from_value(json!({"id":"pr_a","stack_id":"stack_a","name":"Current project","type":"STANDARD_JSON","is_open_source":false,"website":null,"ai_context":null,"created_at":"2026-09-29T00:00:00.123Z","updated_at":"2026-09-29T00:00:00.123Z"})).unwrap();
+        let project: ProjectData = serde_json::from_value(json!({"id":"pr_a","stack_id":"stack_a","name":"Current project","type":"STANDARD_JSON","website":null,"ai_context":null,"created_at":"2026-09-29T00:00:00.123Z","updated_at":"2026-09-29T00:00:00.123Z"})).unwrap();
         let mut tree = TreeComponent::new();
         tree.set_stacks(vec![stack]);
         tree.set_projects(vec![project]);

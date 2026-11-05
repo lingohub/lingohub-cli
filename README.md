@@ -177,7 +177,6 @@ page only when requested.
 Create requests use the bundled schemas. For example, a stack needs `name`,
 `color` and `type`; a project needs `name`, `type`, `source_language_code` and
 `target_language_codes`. Supply JSON with `--file` or use terminal prompts.
-`is_open_source` is a response field, not a writable create field.
 
 The [operation inventory](docs/operations.md) covers every bundled route. The
 [workflow cookbook](docs/cookbook.md) has import/export, shared content, Git,

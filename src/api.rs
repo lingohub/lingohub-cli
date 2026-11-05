@@ -9,7 +9,6 @@ use serde::Deserialize;
 pub struct WorkspaceData {
     pub id: String,
     pub name: String,
-    pub last_active_at: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -31,7 +30,6 @@ pub struct ProjectData {
     pub id: String,
     pub stack_id: String,
     pub name: String,
-    pub is_open_source: bool,
     pub website: Option<String>,
     pub ai_context: Option<String>,
     #[serde(rename = "type")]

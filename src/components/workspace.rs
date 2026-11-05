@@ -73,7 +73,6 @@ fn draw_loaded(f: &mut Frame, area: Rect, data: &WorkspaceData) {
     let rows = [
         ("ID", data.id.as_str()),
         ("Name", data.name.as_str()),
-        ("Last Active", data.last_active_at.as_str()),
         ("Created", data.created_at.as_str()),
         ("Updated", data.updated_at.as_str()),
     ];
