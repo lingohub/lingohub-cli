@@ -62,6 +62,17 @@ pub enum ColorMode {
 }
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Sign in through the browser and store a new personal API key in ~/.lingohub.
+    Login {
+        /// Device name shown for confirmation and in the key name (default: the host name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Only print the confirmation link; do not open a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Revoke the API key stored in ~/.lingohub and remove it from the file.
+    Logout,
     /// Open the interactive workspace dashboard.
     Tui,
     /// Show the authenticated workspace.

@@ -43,8 +43,8 @@ binary and leaves PATH alone. A Homebrew installation is pointed to `brew upgrad
 
 At most once a day, an interactive command that calls the API prints one line on stderr when a
 newer release exists. The lookup runs alongside the command and never delays it. There is no
-notice with `--json`, when `CI` is set, for offline commands, in the dashboard or in the MCP
-server; set `LINGOHUB_NO_UPDATE_CHECK=1` to turn it off. The lookup is an unauthenticated
+notice with `--json`, when `CI` is set, for offline commands, `login` and `logout`, in the
+dashboard or in the MCP server; set `LINGOHUB_NO_UPDATE_CHECK=1` to turn it off. The lookup is an unauthenticated
 request to the GitHub releases API: the LingoHub API key is never sent to it.
 
 ## Build from source
@@ -64,6 +64,28 @@ Contributors: `cargo fmt -- --check`, `cargo test --locked`,
 
 ## Configuration
 
+Sign in once on each computer:
+
+```sh
+lingohub login
+lingohub workspace
+```
+
+`lingohub login` opens a confirmation page in the LingoHub app and prints its link with a
+verification code; check that the page shows the same code before you confirm. `--no-browser`
+only prints the link. The CLI then stores a new personal API key as `LINGOHUB_API_KEY` in
+`~/.lingohub`, readable only by you (mode 600 on macOS and Linux), and leaves every other line of
+that file unchanged. The key is named after the computer (`--name` replaces the host name), is
+valid for 90 days and can be revoked in the LingoHub app at any time; run `lingohub login` again
+for a new one. The key it replaces stays active, because it may be in use elsewhere: revoke it in
+the app if you no longer use it. The key is never printed.
+
+`lingohub logout` revokes the stored key and removes it from `~/.lingohub`. A key that is no
+longer valid is only removed, and so is a workspace-managed key, which a workspace administrator
+revokes in the app. Logout never touches a key from `--api-key` or the environment.
+
+For a key created in the app, or in CI, set the key in the environment instead:
+
 ```sh
 export LINGOHUB_API_KEY=lh-api_your_key_here
 lingohub workspace --json
@@ -79,16 +101,20 @@ Configuration precedence is **command-line flag → process environment → user
 Optional dotenv-format user configuration is read from `$HOME/.lingohub`, falling
 back to `%USERPROFILE%/.lingohub` when `HOME` is absent or empty on Windows.
 A `.env` in the current directory or its parents is never loaded: a checked-out
-repository must not redirect a stored API credential to another host.
+repository must not redirect a stored API credential to another host. Because of this
+precedence, a key from `--api-key` or the environment is used instead of the one `lingohub login`
+stores; login and logout point it out.
 
 Running without a command prints help. `--help`, `--version`, `completion`,
-`api operations` and `api mcp-tools` work offline without a key; `upgrade` needs no key. `lingohub tui` opens
+`api operations` and `api mcp-tools` work offline without a key; `upgrade`, `login` and `logout` need no key. `lingohub tui` opens
 the dashboard and prompts if the key is missing.
 
 ## Commands and output
 
 | Command | Purpose |
 |---|---|
+| `login [--name NAME] [--no-browser]` | Sign in through the browser and store a personal API key |
+| `logout` | Revoke the stored API key and remove it from `~/.lingohub` |
 | `workspace` | Read the authenticated workspace |
 | `stack`, `project`, `style-guide` | `list`, `get`, `create`, `update`, `delete` |
 | `api operations` | List the bundled operation IDs, methods and paths |

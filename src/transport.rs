@@ -52,29 +52,35 @@ pub fn is_loopback(url: &Url) -> bool {
     })
 }
 
+/// Validates the configured API origin: HTTPS, or HTTP only on loopback, without a path.
+pub fn api_origin(base: &str) -> Result<Url, Error> {
+    let base = Url::parse(base).map_err(|_| Error::Input("Invalid API base URL".into()))?;
+    if !matches!(base.scheme(), "https" | "http")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+        || base.path() != "/"
+    {
+        return Err(Error::Input(
+            "API base URL must be an HTTP(S) origin without credentials, query or path".into(),
+        ));
+    }
+    if base.scheme() == "http" && !is_loopback(&base) {
+        return Err(Error::Input(
+            "Remote API origins require HTTPS; HTTP is allowed only on loopback".into(),
+        ));
+    }
+    Ok(base)
+}
+
 impl ApiClient {
     pub fn new(base: &str, token: &str) -> Result<Self, Error> {
-        let base = Url::parse(base).map_err(|_| Error::Input("Invalid API base URL".into()))?;
-        if !matches!(base.scheme(), "https" | "http")
-            || base.host_str().is_none()
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.query().is_some()
-            || base.fragment().is_some()
-            || base.path() != "/"
-        {
-            return Err(Error::Input(
-                "API base URL must be an HTTP(S) origin without credentials, query or path".into(),
-            ));
-        }
-        if base.scheme() == "http" && !is_loopback(&base) {
-            return Err(Error::Input(
-                "Remote API origins require HTTPS; HTTP is allowed only on loopback".into(),
-            ));
-        }
+        let base = api_origin(base)?;
         if token.trim().is_empty() {
             return Err(Error::Input(
-                "API key required: set LINGOHUB_API_KEY or --api-key".into(),
+                "API key required: run `lingohub login`, or set LINGOHUB_API_KEY or --api-key".into(),
             ));
         }
         let mut auth = HeaderValue::from_str(&format!("Bearer {token}"))
@@ -290,7 +296,7 @@ pub fn collection_page(body: &Value) -> Result<(&Vec<Value>, Option<&str>), Erro
     }
 }
 
-fn network_error(e: reqwest::Error) -> Error {
+pub fn network_error(e: reqwest::Error) -> Error {
     Error::Network(
         if e.is_timeout() {
             "Request timed out"

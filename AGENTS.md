@@ -63,6 +63,7 @@ src/
     resource.rs        # Stack/project/style-guide CRUD and paged interactive selection
     upload.rs          # Bounded multipart preparation from contract schemas
     download.rs        # Metadata checks and unauthenticated atomic artifact download
+    login.rs           # `lingohub login`/`logout`: browser confirmation, stored key in ~/.lingohub
     wait.rs            # Bounded polling of the supported asynchronous resources
     mcp_catalog.rs     # OpenAPI → MCP JSON Schema 2020-12 conversion
     mcp_server.rs      # Selected tool execution over MCP stdio
@@ -89,8 +90,8 @@ dist-workspace.toml    # Release targets, installers and Homebrew tap
 
 Only the trusted user `.lingohub` file supplies dotenv configuration; never load a
 working-directory/parent `.env`. Load environment configuration before runtime threads.
-Keep authentication in `transport.rs`; artifact downloads and release lookups must not
-forward it. Use `scripts/sync-contract.py` on a clean official backend checkout (maintainers
+Keep authentication in `transport.rs`; artifact downloads, release lookups and the public
+login endpoints must not forward it. Use `scripts/sync-contract.py` on a clean official backend checkout (maintainers
 with backend access) to update the contract; copy the committed Git blob and preserve its exact
 revision/checksum. Do not hand-edit it.
 

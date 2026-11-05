@@ -7,7 +7,7 @@ use std::{
     net::TcpListener,
     process::{Command, Output, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -12289,4 +12289,765 @@ fn non_interactive_commands_never_look_up_releases() {
     }
     api.finish();
     releases.finish();
+}
+
+const LOGIN_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJjYXRfMSJ9.c2lnbmF0dXJl";
+const LOGIN_SECRET: &str = "login-secret-do-not-print";
+const ISSUED_KEY: &str = "lh-api_eyJhbGciOiJIUzI1NiJ9.issued-key-do-not-print";
+const VERIFICATION_URL: &str =
+    "https://app.lingohub.com/?authentication-token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJjYXRfMSJ9.c2lnbmF0dXJl";
+const ISSUED_KEY_NAME: &str = "LingoHub CLI on Test Laptop (2026-11-04 21:05:33 UTC)";
+
+/// A home directory holding the user configuration of one CLI run.
+struct Home(std::path::PathBuf);
+impl Home {
+    fn new(config: Option<&str>) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "lingohub-home-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The CLI reports the path it was given; resolve macOS /var → /private/var up front.
+        #[cfg(unix)]
+        let dir = dir.canonicalize().unwrap();
+        if let Some(config) = config {
+            std::fs::write(dir.join(".lingohub"), config).unwrap();
+        }
+        Self(dir)
+    }
+    fn config(&self) -> std::path::PathBuf {
+        self.0.join(".lingohub")
+    }
+    fn read(&self) -> Option<String> {
+        std::fs::read_to_string(self.config()).ok()
+    }
+    fn entries(&self) -> Vec<String> {
+        let mut entries = std::fs::read_dir(&self.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+}
+impl Drop for Home {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(unix)]
+fn mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+fn set_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Runs the CLI like a user without LINGOHUB_API_KEY whose home directory is `home`.
+fn login_command(origin: &str, home: &Home, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lingohub"));
+    command
+        .env_clear()
+        .current_dir(&home.0)
+        .env("HOME", &home.0)
+        .envs(env.iter().copied())
+        .args(["--base-url", origin, "--color", "never"])
+        .args(args)
+        .stdin(Stdio::null());
+    #[cfg(windows)]
+    command.env(
+        "SystemRoot",
+        std::env::var_os("SystemRoot").expect("Windows SystemRoot"),
+    );
+    let out = command.output().unwrap();
+    for secret in [LOGIN_SECRET, ISSUED_KEY] {
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(secret));
+    }
+    out
+}
+
+fn login_started(expires_in_seconds: u64, poll_interval_seconds: u64) -> String {
+    response(
+        "200 OK",
+        json!({
+            "clientAuthenticationToken": LOGIN_TOKEN,
+            "secret": LOGIN_SECRET,
+            "verificationCode": "WDJB-MJHT",
+            "verificationUrl": VERIFICATION_URL,
+            "expiresInSeconds": expires_in_seconds,
+            "pollIntervalSeconds": poll_interval_seconds,
+        }),
+        "",
+    )
+}
+
+fn login_pending() -> String {
+    "HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".into()
+}
+
+fn login_issued(expiration_date: Value) -> String {
+    response(
+        "200 OK",
+        json!({
+            "apiKey": ISSUED_KEY,
+            "apiKeyName": ISSUED_KEY_NAME,
+            "workspaceId": "ws_019f9d57-d0ec-7fa2-9c3e-5b1f0a1d2c3e",
+            "workspaceName": "Acme",
+            "expirationDate": expiration_date,
+        }),
+        "",
+    )
+}
+
+fn request_body(raw: &str) -> Value {
+    serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap()
+}
+
+/// Checks the start request and every collect request of one login.
+fn assert_login_requests(requests: &[String], name: &str) {
+    assert!(
+        requests[0].starts_with("POST /public/cli/clientAuthentications HTTP/1.1\r\n"),
+        "{}",
+        requests[0]
+    );
+    assert_eq!(request_body(&requests[0]), json!({"name": name}));
+    for request in &requests[1..] {
+        assert!(
+            request.starts_with(&format!(
+                "POST /public/cli/clientAuthentications/{LOGIN_TOKEN}/apiKey HTTP/1.1\r\n"
+            )),
+            "{request}"
+        );
+        assert_eq!(request_body(request), json!({"secret": LOGIN_SECRET}));
+    }
+    for request in requests {
+        assert!(header_values(request, "Authorization").is_empty(), "{request}");
+        assert!(!request.lines().next().unwrap().contains(LOGIN_SECRET));
+    }
+    assert!(!requests[0].contains(LOGIN_SECRET));
+}
+
+#[test]
+fn login_stores_the_confirmed_key_and_keeps_the_rest_of_the_user_config() {
+    let home = Home::new(Some(
+        "# LingoHub\nFOO=bar\nexport LINGOHUB_API_KEY=old-key # previous\nLINGOHUB_API_KEY=older-key\n\n# end\n",
+    ));
+    #[cfg(unix)]
+    set_mode(&home.config(), 0o644);
+    let stub = Stub::new(vec![
+        login_started(900, 1),
+        login_pending(),
+        login_issued(json!("2027-02-02")),
+    ]);
+    let out = login_command(
+        &stub.origin,
+        &home,
+        &["login", "--name", " Test Laptop ", "--no-browser", "--json"],
+        &[],
+    );
+    assert_eq!(
+        success(&out),
+        json!({
+            "workspace_id": "ws_019f9d57-d0ec-7fa2-9c3e-5b1f0a1d2c3e",
+            "workspace_name": "Acme",
+            "api_key_name": ISSUED_KEY_NAME,
+            "expiration_date": "2027-02-02",
+            "config_file": home.config().to_str().unwrap(),
+        })
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Open this link and check that it shows the code WDJB-MJHT"));
+    assert!(stderr.contains(VERIFICATION_URL));
+    assert!(
+        !stderr.contains("Warning"),
+        "a stored key overrides nothing: {stderr}"
+    );
+    // The replaced key is not revoked: it may be in use elsewhere.
+    assert!(
+        stderr.contains("Note: the API key stored before is still active."),
+        "{stderr}"
+    );
+    let requests = stub.finish();
+    assert_eq!(requests.len(), 3);
+    assert_login_requests(&requests, "Test Laptop");
+    assert!(requests.iter().all(|request| !request.contains("old-key")));
+    // The first assignment takes the new key, a later one is dropped, the rest is untouched.
+    assert_eq!(
+        home.read().unwrap(),
+        format!("# LingoHub\nFOO=bar\nexport LINGOHUB_API_KEY={ISSUED_KEY}\n\n# end\n")
+    );
+    #[cfg(unix)]
+    assert_eq!(mode(&home.config()), 0o600);
+    assert_eq!(home.entries(), [".lingohub"], "no temporary file is left");
+}
+
+#[test]
+fn login_prints_a_summary_creates_a_private_config_and_warns_about_overriding_keys() {
+    for (args, env, expiration, warning) in [
+        (&[][..], &[][..], json!("2027-02-02"), None),
+        (
+            &[],
+            &[("LINGOHUB_API_KEY", "environment-key")],
+            Value::Null,
+            Some("Warning: LINGOHUB_API_KEY in the environment takes precedence over the stored key."),
+        ),
+        (
+            &["--api-key", "flag-key"],
+            &[],
+            Value::Null,
+            Some("Warning: --api-key takes precedence over the stored key."),
+        ),
+    ] {
+        let home = Home::new(None);
+        let stub = Stub::new(vec![login_started(900, 2), login_issued(expiration.clone())]);
+        let mut arguments = vec!["login", "--name", "Test Laptop", "--no-browser"];
+        arguments.extend_from_slice(args);
+        let out = login_command(&stub.origin, &home, &arguments, env);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let validity = if expiration.is_null() {
+            " without an expiration date".to_owned()
+        } else {
+            ", valid until 2027-02-02".to_owned()
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!(
+                "Signed in to Acme with the personal API key \"{ISSUED_KEY_NAME}\"{validity}. Stored in {}.\n",
+                home.config().display()
+            )
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        match warning {
+            Some(warning) => assert!(stderr.contains(warning), "{stderr}"),
+            None => assert!(!stderr.contains("Warning"), "{stderr}"),
+        }
+        let requests = stub.finish();
+        assert_eq!(requests.len(), 2);
+        assert_login_requests(&requests, "Test Laptop");
+        assert_eq!(home.read().unwrap(), format!("LINGOHUB_API_KEY={ISSUED_KEY}\n"));
+        #[cfg(unix)]
+        assert_eq!(mode(&home.config()), 0o600);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn login_updates_a_symlinked_config_where_it_points() {
+    let home = Home::new(None);
+    std::fs::create_dir(home.0.join("dotfiles")).unwrap();
+    let target = home.0.join("dotfiles").join("lingohub.env");
+    std::fs::write(&target, "FOO=bar\n").unwrap();
+    std::os::unix::fs::symlink(&target, home.config()).unwrap();
+    let stub = Stub::new(vec![login_started(900, 1), login_issued(Value::Null)]);
+    let out = login_command(
+        &stub.origin,
+        &home,
+        &["login", "--name", "Test Laptop", "--no-browser"],
+        &[],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    stub.finish();
+    assert!(
+        std::fs::symlink_metadata(home.config())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        format!("FOO=bar\nLINGOHUB_API_KEY={ISSUED_KEY}\n")
+    );
+    assert_eq!(mode(&target), 0o600);
+}
+
+#[test]
+fn login_reports_refused_and_failed_confirmations_without_storing_a_key() {
+    let config = "FOO=bar\nLINGOHUB_API_KEY=old-key\n";
+    let refused = "The login was denied, expired or already used. Run `lingohub login` again.";
+    for (reply, expected) in [
+        // Denied, unknown or a wrong secret.
+        (response("404 Not Found", json!({"status": 404}), ""), refused),
+        // Expired or already used.
+        (
+            response("422 Unprocessable Entity", json!({"status": 422}), ""),
+            refused,
+        ),
+        (
+            response(
+                "503 Service Unavailable",
+                json!({"title": "Service Unavailable", "status": 503}),
+                "",
+            ),
+            "HTTP 503: Service Unavailable",
+        ),
+    ] {
+        let home = Home::new(Some(config));
+        let stub = Stub::new(vec![login_started(900, 1), reply]);
+        let out = login_command(
+            &stub.origin,
+            &home,
+            &["login", "--name", "Test Laptop", "--no-browser"],
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty());
+        assert_error_contains(&out, expected);
+        assert_eq!(stub.finish().len(), 2, "a final answer is not polled again");
+        assert_eq!(home.read().unwrap(), config);
+        assert_eq!(home.entries(), [".lingohub"]);
+    }
+}
+
+#[test]
+fn login_expires_after_the_announced_time() {
+    let home = Home::new(None);
+    let stub = Stub::new(vec![login_started(1, 1), login_pending()]);
+    let started = Instant::now();
+    let out = login_command(
+        &stub.origin,
+        &home,
+        &["login", "--name", "Test Laptop", "--no-browser", "--json"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert_error_contains(&out, "The login expired. Run `lingohub login` again.");
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(stub.finish().len(), 2);
+    assert_eq!(home.read(), None);
+}
+
+#[test]
+fn login_waits_as_asked_after_rate_limits_and_after_slow_answers() {
+    let home = Home::new(None);
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&arrivals);
+    let stub = Stub::with_hook(
+        vec![
+            login_started(900, 1).into_bytes(),
+            response(
+                "429 Too Many Requests",
+                json!({"status": 429}),
+                "Retry-After: 2\r\n",
+            )
+            .into_bytes(),
+            login_pending().into_bytes(),
+            login_issued(json!("2027-02-02")).into_bytes(),
+        ],
+        move |_| {
+            let mut arrivals = recorded.lock().unwrap();
+            arrivals.push(Instant::now());
+            // The third answer is slow.
+            if arrivals.len() == 3 {
+                thread::sleep(Duration::from_millis(1500));
+            }
+        },
+    );
+    let out = login_command(
+        &stub.origin,
+        &home,
+        &["login", "--name", "Test Laptop", "--no-browser", "--json"],
+        &[],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_login_requests(&stub.finish(), "Test Laptop");
+    let arrivals = arrivals.lock().unwrap();
+    assert_eq!(arrivals.len(), 4);
+    // A rate limit is no refusal: polling goes on after the requested wait, not the interval.
+    assert!(arrivals[2] - arrivals[1] >= Duration::from_millis(1900));
+    // The interval counts from the slow answer, not from when the poll was due.
+    assert!(arrivals[3] - arrivals[2] >= Duration::from_millis(2400));
+    assert_eq!(home.read().unwrap(), format!("LINGOHUB_API_KEY={ISSUED_KEY}\n"));
+}
+
+/// A key the API creates could not be stored, so login stops before it starts.
+#[cfg(unix)]
+#[test]
+fn login_fails_before_any_request_when_the_config_cannot_be_written() {
+    let home = Home::new(Some("FOO=bar\n"));
+    set_mode(&home.0, 0o555);
+    // Root writes anyway, which leaves nothing to test.
+    let probe = home.0.join("probe");
+    if std::fs::write(&probe, "").is_ok() {
+        let _ = std::fs::remove_file(probe);
+        set_mode(&home.0, 0o755);
+        return;
+    }
+    let stub = Stub::new(vec![]);
+    let out = login_command(
+        &stub.origin,
+        &home,
+        &["login", "--name", "Test Laptop", "--no-browser"],
+        &[],
+    );
+    set_mode(&home.0, 0o755);
+    assert_eq!(out.status.code(), Some(1));
+    assert_error_contains(&out, "cannot write next to");
+    assert!(stub.finish().is_empty());
+    assert_eq!(home.read().unwrap(), "FOO=bar\n");
+    assert_eq!(home.entries(), [".lingohub"]);
+}
+
+#[test]
+fn login_rejects_failed_starts_and_unsafe_confirmation_links() {
+    let mut unsafe_link: Value =
+        serde_json::from_str(login_started(900, 1).split_once("\r\n\r\n").unwrap().1).unwrap();
+    unsafe_link["verificationUrl"] = json!("http://example.com/?authentication-token=x");
+    for (reply, expected) in [
+        (
+            response("200 OK", unsafe_link, ""),
+            "The API returned an invalid login; no login was started",
+        ),
+        (
+            response(
+                "400 Bad Request",
+                json!({"title": "Bad Request", "status": 400, "detail": "name must not be blank"}),
+                "",
+            ),
+            "HTTP 400: Bad Request\ndetail: name must not be blank",
+        ),
+        (
+            response(
+                "429 Too Many Requests",
+                json!({"error": {"code": "client.authentication.rate_limit"}}),
+                "",
+            ),
+            "HTTP 429: Too many logins were started from this network\ndetail: Wait a minute, then run `lingohub login` again.",
+        ),
+    ] {
+        let home = Home::new(None);
+        let stub = Stub::new(vec![reply]);
+        let out = login_command(
+            &stub.origin,
+            &home,
+            &["login", "--name", "Test Laptop", "--no-browser"],
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(1));
+        assert_error_contains(&out, expected);
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("example.com"));
+        assert_eq!(stub.finish().len(), 1);
+        assert_eq!(home.read(), None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn login_opens_the_link_in_the_browser_and_names_the_device_after_the_host() {
+    let home = Home::new(None);
+    let bin = home.0.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let marker = home.0.join("opened");
+    // macOS opens links with `open`, other Unix systems with `xdg-open`.
+    for (name, script) in [
+        ("hostname", "#!/bin/sh\necho ' fake-host '\n"),
+        (
+            "open",
+            "#!/bin/sh\nprintf '%s' \"$1\" > \"$LINGOHUB_TEST_MARKER.tmp\"\n/bin/mv \"$LINGOHUB_TEST_MARKER.tmp\" \"$LINGOHUB_TEST_MARKER\"\n",
+        ),
+    ] {
+        std::fs::write(bin.join(name), script).unwrap();
+        set_mode(&bin.join(name), 0o755);
+    }
+    std::fs::copy(bin.join("open"), bin.join("xdg-open")).unwrap();
+    let stub = Stub::new(vec![login_started(900, 1), login_issued(Value::Null)]);
+    let out = login_command(
+        &stub.origin,
+        &home,
+        &["login", "--json"],
+        &[
+            ("PATH", bin.to_str().unwrap()),
+            ("LINGOHUB_TEST_MARKER", marker.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(success(&out)["workspace_name"], "Acme");
+    let requests = stub.finish();
+    assert_login_requests(&requests, "fake-host");
+    // The browser is started in the background; give it a moment.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), VERIFICATION_URL);
+}
+
+#[test]
+fn logout_revokes_the_stored_key_and_removes_it() {
+    let config = "# LingoHub\nFOO=bar\nexport LINGOHUB_API_KEY=stored-key\n# end\n";
+    for (args, env, note) in [
+        (
+            &["logout"][..],
+            &[("LINGOHUB_API_KEY", "environment-key")][..],
+            "Note: LINGOHUB_API_KEY in the environment is not affected.",
+        ),
+        (
+            &["--api-key", "flag-key", "logout", "--json"],
+            &[],
+            "Note: the key passed with --api-key is not affected.",
+        ),
+    ] {
+        let home = Home::new(Some(config));
+        #[cfg(unix)]
+        set_mode(&home.config(), 0o644);
+        let stub = Stub::new(vec![
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into(),
+        ]);
+        let out = login_command(&stub.origin, &home, args, env);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        if args.contains(&"--json") {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                json!({
+                    "config_file": home.config().to_str().unwrap(),
+                    "outcome": "revoked",
+                    "revoked": true,
+                    "removed": true,
+                })
+            );
+        } else {
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!(
+                    "Signed out; the key was revoked and removed from {}.\n",
+                    home.config().display()
+                )
+            );
+        }
+        assert!(String::from_utf8_lossy(&out.stderr).contains(note));
+        let requests = stub.finish();
+        assert!(
+            requests[0].starts_with("DELETE /v2/api-key HTTP/1.1\r\n"),
+            "{}",
+            requests[0]
+        );
+        // Only the stored key is revoked, never the one from the environment or the flag.
+        assert_eq!(
+            header_values(&requests[0], "Authorization"),
+            ["Bearer stored-key"]
+        );
+        assert!(header_values(&requests[0], "If-Match").is_empty());
+        assert_eq!(home.read().unwrap(), "# LingoHub\nFOO=bar\n# end\n");
+        #[cfg(unix)]
+        assert_eq!(mode(&home.config()), 0o600);
+        assert_eq!(home.entries(), [".lingohub"]);
+    }
+}
+
+#[test]
+fn logout_removes_invalid_and_workspace_managed_keys_without_revoking_them() {
+    let config = "FOO=bar\nLINGOHUB_API_KEY=stored-key\n";
+    for (status, outcome, message) in [
+        (
+            "401 Unauthorized",
+            "already_invalid",
+            "The stored key was no longer valid and has been removed from {path}.",
+        ),
+        (
+            "403 Forbidden",
+            "workspace_managed",
+            "The stored key was removed from {path}, but not revoked: it is managed by the workspace, and only a workspace administrator can revoke it.",
+        ),
+    ] {
+        for json_output in [false, true] {
+            let home = Home::new(Some(config));
+            let code = if status.starts_with("403") {
+                "insufficient_permissions"
+            } else {
+                "unauthorized"
+            };
+            let stub = Stub::new(vec![response(status, json!({"title": status, "code": code}), "")]);
+            let args: &[&str] = if json_output {
+                &["logout", "--json"]
+            } else {
+                &["logout"]
+            };
+            let out = login_command(&stub.origin, &home, args, &[]);
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            if json_output {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    json!({
+                        "config_file": home.config().to_str().unwrap(),
+                        "outcome": outcome,
+                        "revoked": false,
+                        "removed": true,
+                    })
+                );
+            } else {
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    format!(
+                        "{}\n",
+                        message.replace("{path}", &home.config().display().to_string())
+                    )
+                );
+            }
+            let requests = stub.finish();
+            assert_eq!(
+                header_values(&requests[0], "Authorization"),
+                ["Bearer stored-key"]
+            );
+            assert_eq!(home.read().unwrap(), "FOO=bar\n");
+        }
+    }
+}
+
+#[test]
+fn logout_keeps_the_stored_key_when_revocation_fails() {
+    let config = "FOO=bar\nLINGOHUB_API_KEY=stored-key\n";
+    let home = Home::new(Some(config));
+    let stub = Stub::new(vec![response(
+        "500 Internal Server Error",
+        json!({"title": "Internal Server Error", "status": 500}),
+        "",
+    )]);
+    let out = login_command(&stub.origin, &home, &["logout"], &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert_error_contains(&out, "HTTP 500: Internal Server Error");
+    stub.finish();
+    assert_eq!(home.read().unwrap(), config);
+
+    let out = login_command("http://127.0.0.1:1", &home, &["logout", "--json"], &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stderr).unwrap(),
+        json!({"error": "Could not connect to the API"})
+    );
+    assert_eq!(home.read().unwrap(), config);
+    assert_eq!(home.entries(), [".lingohub"]);
+}
+
+#[test]
+fn logout_keeps_a_key_stored_while_it_ran() {
+    let home = Home::new(Some("FOO=bar\nLINGOHUB_API_KEY=stored-key\n"));
+    let config = home.config();
+    // Another login stores a new key while the old one is being revoked.
+    let stub = Stub::with_hook(
+        vec!["HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into()],
+        move |_| std::fs::write(&config, "FOO=bar\nLINGOHUB_API_KEY=newer-key\n").unwrap(),
+    );
+    let out = login_command(&stub.origin, &home, &["logout", "--json"], &[]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!({
+            "config_file": home.config().to_str().unwrap(),
+            "outcome": "revoked",
+            "revoked": true,
+            "removed": false,
+        })
+    );
+    assert_eq!(
+        header_values(&stub.finish()[0], "Authorization"),
+        ["Bearer stored-key"]
+    );
+    assert_eq!(home.read().unwrap(), "FOO=bar\nLINGOHUB_API_KEY=newer-key\n");
+}
+
+#[test]
+fn logout_without_a_stored_key_sends_no_request() {
+    let trap = Stub::new(vec![]);
+    for config in [
+        None,
+        Some("FOO=bar\n# LINGOHUB_API_KEY=commented-out\nLINGOHUB_API_KEY_OLD=other\n"),
+        Some("LINGOHUB_API_KEY=\n"),
+    ] {
+        for (args, env) in [
+            (&["logout"][..], &[][..]),
+            // A key from the environment is never revoked.
+            (&["logout"], &[("LINGOHUB_API_KEY", "environment-key")]),
+        ] {
+            let home = Home::new(config);
+            let out = login_command(&trap.origin, &home, args, env);
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("No API key is stored in {}.\n", home.config().display())
+            );
+            assert_eq!(home.read().as_deref(), config);
+        }
+    }
+    let home = Home::new(None);
+    let out = login_command(&trap.origin, &home, &["logout", "--json"], &[]);
+    assert_eq!(
+        success(&out),
+        json!({
+            "config_file": home.config().to_str().unwrap(),
+            "outcome": "no_stored_key",
+            "revoked": false,
+            "removed": false,
+        })
+    );
+    trap.finish();
+}
+
+#[test]
+fn login_and_logout_reject_request_flags_invalid_names_and_remote_http_before_network() {
+    let trap = Stub::new(vec![]);
+    let home = Home::new(Some("LINGOHUB_API_KEY=stored-key\n"));
+    for command in [&["login", "--no-browser"][..], &["logout"]] {
+        for (flags, expected) in [
+            (
+                &["--file", "body.json"][..],
+                "This command does not accept --file, --field, --if-match or --idempotency-key",
+            ),
+            (
+                &["--field", "name=\"x\""],
+                "This command does not accept --file, --field, --if-match or --idempotency-key",
+            ),
+            (
+                &["--if-match", "\"etag\""],
+                "This command does not accept --file, --field, --if-match or --idempotency-key",
+            ),
+            (
+                &["--idempotency-key", "key"],
+                "This command does not accept --file, --field, --if-match or --idempotency-key",
+            ),
+            (
+                &["--include-headers"],
+                "This command does not expose HTTP response headers",
+            ),
+        ] {
+            let mut args = command.to_vec();
+            args.extend_from_slice(flags);
+            let out = login_command(&trap.origin, &home, &args, &[]);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            assert_error_contains(&out, expected);
+        }
+    }
+    let long = "x".repeat(101);
+    for name in ["", "   ", long.as_str(), "bad\u{1b}[31mname"] {
+        let out = login_command(
+            &trap.origin,
+            &home,
+            &["login", "--no-browser", "--name", name],
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(2), "{name:?}");
+        assert_error_contains(
+            &out,
+            "--name must have 1 to 100 characters and no control characters",
+        );
+    }
+    for command in [
+        &["login", "--name", "Test Laptop", "--no-browser"][..],
+        &["logout"],
+    ] {
+        let out = login_command("http://example.com", &home, command, &[]);
+        assert_eq!(out.status.code(), Some(2), "{command:?}");
+        assert_error_contains(
+            &out,
+            "Remote API origins require HTTPS; HTTP is allowed only on loopback",
+        );
+    }
+    trap.finish();
+    assert_eq!(home.read().unwrap(), "LINGOHUB_API_KEY=stored-key\n");
 }
