@@ -500,6 +500,48 @@ mod tests {
         assert!(rendered.contains("Current project"));
         assert!(rendered.contains("STANDARD_JSON"));
     }
+
+    fn render(tree: &mut TreeComponent, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
+        terminal.draw(|frame| tree.draw(frame, frame.area())).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn expanded_project_shows_five_details_and_keeps_the_next_stack_reachable() {
+        let stack = |id: &str, name: &str| -> StackData {
+            serde_json::from_value(json!({"id":id,"name":name,"color":"#123456","type":"PUBLIC","character_count":null,"word_count":42,"counts_updated_at":"2026-09-29T00:00:00.123Z","created_at":"2026-09-29T00:00:00.123Z","updated_at":"2026-09-29T00:00:00.123Z"})).unwrap()
+        };
+        let project: ProjectData = serde_json::from_value(json!({"id":"pr_a","stack_id":"stack_a","name":"Current project","type":"STANDARD_JSON","website":"example.com","ai_context":"Checkout","created_at":"2026-09-29T00:00:00.123Z","updated_at":"2026-09-30T00:00:00.123Z"})).unwrap();
+        let mut tree = TreeComponent::new();
+        tree.set_stacks(vec![
+            stack("stack_a", "First stack"),
+            stack("stack_b", "Second stack"),
+        ]);
+        tree.set_projects(vec![project]);
+
+        // Content height 11: the first stack (1 + 7 detail lines), the project (1 + 5) and the second stack
+        // need 15 lines, so reaching the second stack scrolls by the exact number of project detail rows.
+        render(&mut tree, 14);
+        tree.update(&Action::ToggleExpand);
+        tree.update(&Action::SelectNext);
+        tree.update(&Action::ToggleExpand);
+        let expanded = render(&mut tree, 30);
+        for detail in ["pr_a", "example.com", "Checkout", "2026-09-30T00:00:00.123Z"] {
+            assert!(expanded.contains(detail), "{detail}");
+        }
+        assert!(!expanded.contains("Open Source"));
+
+        render(&mut tree, 14);
+        tree.update(&Action::SelectNext);
+        assert!(render(&mut tree, 14).contains("Second stack"));
+    }
 }
 
 // vim: foldmethod=marker foldmarker=<<<,>>>
