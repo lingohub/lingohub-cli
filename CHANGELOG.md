@@ -2,6 +2,11 @@
 
 All notable changes to the LingoHub CLI. Versions follow [semantic versioning](https://semver.org).
 
+## 0.2.1 - 2026-11-05
+
+- `lingohub tui` keeps working when the API stops sending a workspace's last activity and a
+  project's open-source flag; the dashboard no longer shows either value
+
 ## 0.2.0 - 2026-11-05
 
 - `lingohub login` signs in through the browser: after you confirm the login in the LingoHub app,
