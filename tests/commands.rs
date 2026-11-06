@@ -11860,7 +11860,7 @@ fn human_resource_views_restore_labels_alignment_placeholders_and_real_page_coun
 
 #[test]
 fn resource_colors_respect_policy_and_json_keeps_every_wire_field() {
-    let body = json!({"object_type":"WORKSPACE","id":"space_test","name":"Example","last_active_at":null});
+    let body = json!({"object_type":"WORKSPACE","id":"space_test","name":"Example","updated_at":null});
     for (color, json_mode, colored) in [
         ("always", false, true),
         ("never", false, false),
@@ -11879,7 +11879,7 @@ fn resource_colors_respect_policy_and_json_keeps_every_wire_field() {
             assert_eq!(success(&out), body);
         } else {
             let text = String::from_utf8_lossy(&out.stdout);
-            assert!(text.contains("Last Active At"));
+            assert!(text.contains("Updated At"));
             assert!(text.contains('—'));
         }
         stub.finish();

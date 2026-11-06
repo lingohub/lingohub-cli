@@ -73,7 +73,6 @@ fn draw_loaded(f: &mut Frame, area: Rect, data: &WorkspaceData) {
     let rows = [
         ("ID", data.id.as_str()),
         ("Name", data.name.as_str()),
-        ("Last Active", data.last_active_at.as_str()),
         ("Created", data.created_at.as_str()),
         ("Updated", data.updated_at.as_str()),
     ];
@@ -104,4 +103,37 @@ fn draw_loaded(f: &mut Frame, area: Rect, data: &WorkspaceData) {
 }
 // >>>
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+    use serde_json::json;
+
+    #[test]
+    fn workspace_panel_shows_retained_fields_without_last_activity() {
+        let data: WorkspaceData = serde_json::from_value(json!({"id":"space_a","name":"Example workspace","created_at":"2026-09-29T00:00:00.123Z","updated_at":"2026-09-30T00:00:00.123Z"})).unwrap();
+        let mut workspace = WorkspaceComponent::new();
+        workspace.set_data(data);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| workspace.draw(frame, frame.area()))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for value in [
+            "space_a",
+            "Example workspace",
+            "2026-09-29T00:00:00.123Z",
+            "2026-09-30T00:00:00.123Z",
+        ] {
+            assert!(rendered.contains(value), "{value}");
+        }
+        assert!(!rendered.contains("Last Active"));
+    }
+}
 // vim: foldmethod=marker foldmarker=<<<,>>>
