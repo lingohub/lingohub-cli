@@ -1,6 +1,6 @@
 # V2 CLI operation inventory
 
-Backend revision: `fb1b7a081e08654185b437ec015a0bbbb0b04c71`. This records addressability, not completed workflow tests.
+Backend revision: `06d36df8cd8db7941d77ff356575e1132bd881c7`. This records addressability, not completed workflow tests.
 
 Named-operation support does not establish a complete workflow; the [workflow cookbook](cookbook.md) shows complete examples. JSON operations support one-request `api call OPERATION --path NAME=VALUE --query NAME=VALUE`; resource commands also cover workspace and stack/project/style-guide CRUD. Multipart operations use `api upload OPERATION --upload PATH --form NAME=VALUE`; completed export artifacts use `api download-export EXPORT_ID --output PATH`, individual entries use `api download-export-entry EXPORT_ID ENTRY_ID --output PATH`, distribution releases use `api download-distribution-release RELEASE_ID --output PATH`; known async resources use `api wait OPERATION --path NAME=VALUE`; dedicated commands for other groups remain pending.
 
@@ -288,13 +288,6 @@ Named-operation support does not establish a complete workflow; the [workflow co
 | `deleteStyleGuideLanguageRules` | `DELETE /v2/style-guides/{styleGuideId}/rules/{languageCode}` | JSON operation call |
 | `getStyleGuideLanguageRules` | `GET /v2/style-guides/{styleGuideId}/rules/{languageCode}` | JSON operation call |
 | `setStyleGuideLanguageRules` | `PUT /v2/style-guides/{styleGuideId}/rules/{languageCode}` | JSON operation call |
-| `listTasks` | `GET /v2/tasks` | JSON operation call |
-| `getTask` | `GET /v2/tasks/{taskId}` | JSON operation call |
-| `closeTask` | `POST /v2/tasks/{taskId}/close` | JSON operation call |
-| `listTaskContributors` | `GET /v2/tasks/{taskId}/contributors` | JSON operation call |
-| `getTaskCounts` | `GET /v2/tasks/{taskId}/counts` | JSON operation call |
-| `getTaskDetails` | `GET /v2/tasks/{taskId}/details` | JSON operation call |
-| `skipTask` | `POST /v2/tasks/{taskId}/skip` | JSON operation call |
 | `deleteTermForm` | `DELETE /v2/term-forms/{termFormId}` | JSON operation call |
 | `getTermForm` | `GET /v2/term-forms/{termFormId}` | JSON operation call |
 | `updateTermForm` | `PATCH /v2/term-forms/{termFormId}` | JSON operation call |

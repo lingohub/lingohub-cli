@@ -1,6 +1,6 @@
 {
   "repository": "lingohub/lh-backend",
-  "revision": "fb1b7a081e08654185b437ec015a0bbbb0b04c71",
+  "revision": "06d36df8cd8db7941d77ff356575e1132bd881c7",
   "path": "src/main/resources/api-v2-documentation/openapi.json",
-  "sha256": "c4f4f83e7c3d01b8310e67058b42510826ab12d7be1e25a1474bf619320ab3c3"
+  "sha256": "3f9d6b3dbd2e31b341dd79d85861edaa4348a787bfd37c73179f050f99e49b24"
 }
