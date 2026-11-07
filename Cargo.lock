@@ -1446,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "lingohub"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "clap-i18n-richformatter",

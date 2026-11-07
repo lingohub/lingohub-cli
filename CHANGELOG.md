@@ -2,6 +2,11 @@
 
 All notable changes to the LingoHub CLI. Versions follow [semantic versioning](https://semver.org).
 
+## 0.2.2 - 2026-11-07
+
+- The bundled API V2 contract matches the current API: the Tasks operations are gone, and
+  Mistral Large 4 is a known linguistic engine model
+
 ## 0.2.1 - 2026-11-05
 
 - `lingohub tui` keeps working when the API stops sending a workspace's last activity and a
