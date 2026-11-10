@@ -2,6 +2,13 @@
 
 All notable changes to the LingoHub CLI. Versions follow [semantic versioning](https://semver.org).
 
+## 0.2.3 - 2026-11-10
+
+- The bundled API V2 contract matches the current API: segments and new keys no longer have an
+  `ai_context` field (LINA reads a segment's `description` instead), and GPT 6 Luna, GPT 6.1
+  Terra, GPT 6.1 Sol, Gemini 3.8 Flash, Claude Haiku 5.5, Claude Sonnet 5.5 and Claude Opus 5.5
+  are known linguistic engine models
+
 ## 0.2.2 - 2026-11-07
 
 - The bundled API V2 contract matches the current API: the Tasks operations are gone, and
