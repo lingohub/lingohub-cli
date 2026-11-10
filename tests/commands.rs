@@ -1150,7 +1150,7 @@ fn named_key_creation_preserves_structured_body_and_created_location() {
             {"device":"PHONE", "plural_form":"ONE", "content":"One apple"},
             {"device":"TABLET", "plural_form":"OTHER", "content":"Apples"}
         ],
-        "group_key": null, "label_ids": null, "ai_context": "Fruit counter"
+        "group_key": null, "label_ids": null
     });
     let created = json!({"object_type":"KEY", "id":key_id, "is_plural":true});
     let stub = Stub::new(vec![response(

@@ -6899,14 +6899,6 @@
       "CreateKey" : {
         "description" : "Request body to create a key in a file, together with its fresh shared segment and ordered source variants.",
         "properties" : {
-          "ai_context" : {
-            "description" : "Context for AI translation. Omission or null means no context.",
-            "example" : "Short button label",
-            "maxLength" : 256,
-            "minLength" : 0,
-            "nullable" : true,
-            "type" : "string"
-          },
           "group_key" : {
             "description" : "Separate group for REQUIRED_KEY_WITH_GROUP formats only. Omission or null means no group; other formats reject non-null values.",
             "example" : "navigation",
@@ -7144,7 +7136,7 @@
             "type" : "boolean"
           },
           "is_segments_enabled" : {
-            "description" : "Enable segments context.",
+            "description" : "Whether LINA reads the descriptions of segments.",
             "example" : false,
             "type" : "boolean"
           },
@@ -17147,7 +17139,7 @@
             "type" : "boolean"
           },
           "is_segments_enabled" : {
-            "description" : "Whether related segment context is enabled.",
+            "description" : "Whether LINA reads the descriptions of segments.",
             "example" : true,
             "type" : "boolean"
           },
@@ -18624,24 +18616,24 @@
             "minProperties" : 1,
             "properties" : {
               "_eq" : {
-                "enum" : [ "MT_GOOGLE_TRANSLATE_V3", "MT_DEEPL_TRANSLATE_V1", "MT_AWS_TRANSLATE", "AI_GPT_5_4", "AI_GPT_5_4_MINI", "AI_GPT_5_4_NANO", "AI_GPT_5_6_SOL", "AI_GPT_5_6_TERRA", "AI_GPT_5_6_LUNA", "AI_GEMINI_2_5_FLASH", "AI_GEMINI_2_5_PRO", "AI_GEMINI_3_6_FLASH", "AI_GEMINI_3_5_FLASH_LITE", "AI_CLAUDE_OPUS_4_7", "AI_CLAUDE_SONNET_4_6", "AI_CLAUDE_HAIKU_4_5", "AI_CLAUDE_OPUS_5", "AI_CLAUDE_SONNET_5", "AI_MISTRAL_LARGE_3", "AI_MISTRAL_SMALL_4", "AI_MISTRAL_MEDIUM_3_5", "AI_MISTRAL_LARGE_4" ],
+                "enum" : [ "MT_GOOGLE_TRANSLATE_V3", "MT_DEEPL_TRANSLATE_V1", "MT_AWS_TRANSLATE", "AI_GPT_5_4", "AI_GPT_5_4_MINI", "AI_GPT_5_4_NANO", "AI_GPT_5_6_SOL", "AI_GPT_5_6_TERRA", "AI_GPT_5_6_LUNA", "AI_GEMINI_2_5_FLASH", "AI_GEMINI_2_5_PRO", "AI_GEMINI_3_6_FLASH", "AI_GEMINI_3_5_FLASH_LITE", "AI_CLAUDE_OPUS_4_7", "AI_CLAUDE_SONNET_4_6", "AI_CLAUDE_HAIKU_4_5", "AI_CLAUDE_OPUS_5", "AI_CLAUDE_SONNET_5", "AI_MISTRAL_LARGE_3", "AI_MISTRAL_SMALL_4", "AI_MISTRAL_MEDIUM_3_5", "AI_MISTRAL_LARGE_4", "AI_GPT_6_LUNA", "AI_GPT_6_1_TERRA", "AI_GPT_6_1_SOL", "AI_GEMINI_3_8_FLASH", "AI_CLAUDE_OPUS_5_5", "AI_CLAUDE_SONNET_5_5", "AI_CLAUDE_HAIKU_5_5" ],
                 "type" : "string"
               },
               "_in" : {
                 "items" : {
-                  "enum" : [ "MT_GOOGLE_TRANSLATE_V3", "MT_DEEPL_TRANSLATE_V1", "MT_AWS_TRANSLATE", "AI_GPT_5_4", "AI_GPT_5_4_MINI", "AI_GPT_5_4_NANO", "AI_GPT_5_6_SOL", "AI_GPT_5_6_TERRA", "AI_GPT_5_6_LUNA", "AI_GEMINI_2_5_FLASH", "AI_GEMINI_2_5_PRO", "AI_GEMINI_3_6_FLASH", "AI_GEMINI_3_5_FLASH_LITE", "AI_CLAUDE_OPUS_4_7", "AI_CLAUDE_SONNET_4_6", "AI_CLAUDE_HAIKU_4_5", "AI_CLAUDE_OPUS_5", "AI_CLAUDE_SONNET_5", "AI_MISTRAL_LARGE_3", "AI_MISTRAL_SMALL_4", "AI_MISTRAL_MEDIUM_3_5", "AI_MISTRAL_LARGE_4" ],
+                  "enum" : [ "MT_GOOGLE_TRANSLATE_V3", "MT_DEEPL_TRANSLATE_V1", "MT_AWS_TRANSLATE", "AI_GPT_5_4", "AI_GPT_5_4_MINI", "AI_GPT_5_4_NANO", "AI_GPT_5_6_SOL", "AI_GPT_5_6_TERRA", "AI_GPT_5_6_LUNA", "AI_GEMINI_2_5_FLASH", "AI_GEMINI_2_5_PRO", "AI_GEMINI_3_6_FLASH", "AI_GEMINI_3_5_FLASH_LITE", "AI_CLAUDE_OPUS_4_7", "AI_CLAUDE_SONNET_4_6", "AI_CLAUDE_HAIKU_4_5", "AI_CLAUDE_OPUS_5", "AI_CLAUDE_SONNET_5", "AI_MISTRAL_LARGE_3", "AI_MISTRAL_SMALL_4", "AI_MISTRAL_MEDIUM_3_5", "AI_MISTRAL_LARGE_4", "AI_GPT_6_LUNA", "AI_GPT_6_1_TERRA", "AI_GPT_6_1_SOL", "AI_GEMINI_3_8_FLASH", "AI_CLAUDE_OPUS_5_5", "AI_CLAUDE_SONNET_5_5", "AI_CLAUDE_HAIKU_5_5" ],
                   "type" : "string"
                 },
                 "minItems" : 1,
                 "type" : "array"
               },
               "_ne" : {
-                "enum" : [ "MT_GOOGLE_TRANSLATE_V3", "MT_DEEPL_TRANSLATE_V1", "MT_AWS_TRANSLATE", "AI_GPT_5_4", "AI_GPT_5_4_MINI", "AI_GPT_5_4_NANO", "AI_GPT_5_6_SOL", "AI_GPT_5_6_TERRA", "AI_GPT_5_6_LUNA", "AI_GEMINI_2_5_FLASH", "AI_GEMINI_2_5_PRO", "AI_GEMINI_3_6_FLASH", "AI_GEMINI_3_5_FLASH_LITE", "AI_CLAUDE_OPUS_4_7", "AI_CLAUDE_SONNET_4_6", "AI_CLAUDE_HAIKU_4_5", "AI_CLAUDE_OPUS_5", "AI_CLAUDE_SONNET_5", "AI_MISTRAL_LARGE_3", "AI_MISTRAL_SMALL_4", "AI_MISTRAL_MEDIUM_3_5", "AI_MISTRAL_LARGE_4" ],
+                "enum" : [ "MT_GOOGLE_TRANSLATE_V3", "MT_DEEPL_TRANSLATE_V1", "MT_AWS_TRANSLATE", "AI_GPT_5_4", "AI_GPT_5_4_MINI", "AI_GPT_5_4_NANO", "AI_GPT_5_6_SOL", "AI_GPT_5_6_TERRA", "AI_GPT_5_6_LUNA", "AI_GEMINI_2_5_FLASH", "AI_GEMINI_2_5_PRO", "AI_GEMINI_3_6_FLASH", "AI_GEMINI_3_5_FLASH_LITE", "AI_CLAUDE_OPUS_4_7", "AI_CLAUDE_SONNET_4_6", "AI_CLAUDE_HAIKU_4_5", "AI_CLAUDE_OPUS_5", "AI_CLAUDE_SONNET_5", "AI_MISTRAL_LARGE_3", "AI_MISTRAL_SMALL_4", "AI_MISTRAL_MEDIUM_3_5", "AI_MISTRAL_LARGE_4", "AI_GPT_6_LUNA", "AI_GPT_6_1_TERRA", "AI_GPT_6_1_SOL", "AI_GEMINI_3_8_FLASH", "AI_CLAUDE_OPUS_5_5", "AI_CLAUDE_SONNET_5_5", "AI_CLAUDE_HAIKU_5_5" ],
                 "type" : "string"
               },
               "_nin" : {
                 "items" : {
-                  "enum" : [ "MT_GOOGLE_TRANSLATE_V3", "MT_DEEPL_TRANSLATE_V1", "MT_AWS_TRANSLATE", "AI_GPT_5_4", "AI_GPT_5_4_MINI", "AI_GPT_5_4_NANO", "AI_GPT_5_6_SOL", "AI_GPT_5_6_TERRA", "AI_GPT_5_6_LUNA", "AI_GEMINI_2_5_FLASH", "AI_GEMINI_2_5_PRO", "AI_GEMINI_3_6_FLASH", "AI_GEMINI_3_5_FLASH_LITE", "AI_CLAUDE_OPUS_4_7", "AI_CLAUDE_SONNET_4_6", "AI_CLAUDE_HAIKU_4_5", "AI_CLAUDE_OPUS_5", "AI_CLAUDE_SONNET_5", "AI_MISTRAL_LARGE_3", "AI_MISTRAL_SMALL_4", "AI_MISTRAL_MEDIUM_3_5", "AI_MISTRAL_LARGE_4" ],
+                  "enum" : [ "MT_GOOGLE_TRANSLATE_V3", "MT_DEEPL_TRANSLATE_V1", "MT_AWS_TRANSLATE", "AI_GPT_5_4", "AI_GPT_5_4_MINI", "AI_GPT_5_4_NANO", "AI_GPT_5_6_SOL", "AI_GPT_5_6_TERRA", "AI_GPT_5_6_LUNA", "AI_GEMINI_2_5_FLASH", "AI_GEMINI_2_5_PRO", "AI_GEMINI_3_6_FLASH", "AI_GEMINI_3_5_FLASH_LITE", "AI_CLAUDE_OPUS_4_7", "AI_CLAUDE_SONNET_4_6", "AI_CLAUDE_HAIKU_4_5", "AI_CLAUDE_OPUS_5", "AI_CLAUDE_SONNET_5", "AI_MISTRAL_LARGE_3", "AI_MISTRAL_SMALL_4", "AI_MISTRAL_MEDIUM_3_5", "AI_MISTRAL_LARGE_4", "AI_GPT_6_LUNA", "AI_GPT_6_1_TERRA", "AI_GPT_6_1_SOL", "AI_GEMINI_3_8_FLASH", "AI_CLAUDE_OPUS_5_5", "AI_CLAUDE_SONNET_5_5", "AI_CLAUDE_HAIKU_5_5" ],
                   "type" : "string"
                 },
                 "minItems" : 1,
@@ -18727,7 +18719,7 @@
       },
       "LinguisticEngineModel" : {
         "description" : "Public LinguisticEngineModel values.",
-        "enum" : [ "MT_GOOGLE_TRANSLATE_V3", "MT_DEEPL_TRANSLATE_V1", "MT_AWS_TRANSLATE", "AI_GPT_5_4", "AI_GPT_5_4_MINI", "AI_GPT_5_4_NANO", "AI_GPT_5_6_SOL", "AI_GPT_5_6_TERRA", "AI_GPT_5_6_LUNA", "AI_GEMINI_2_5_FLASH", "AI_GEMINI_2_5_PRO", "AI_GEMINI_3_6_FLASH", "AI_GEMINI_3_5_FLASH_LITE", "AI_CLAUDE_OPUS_4_7", "AI_CLAUDE_SONNET_4_6", "AI_CLAUDE_HAIKU_4_5", "AI_CLAUDE_OPUS_5", "AI_CLAUDE_SONNET_5", "AI_MISTRAL_LARGE_3", "AI_MISTRAL_SMALL_4", "AI_MISTRAL_MEDIUM_3_5", "AI_MISTRAL_LARGE_4" ],
+        "enum" : [ "MT_GOOGLE_TRANSLATE_V3", "MT_DEEPL_TRANSLATE_V1", "MT_AWS_TRANSLATE", "AI_GPT_5_4", "AI_GPT_5_4_MINI", "AI_GPT_5_4_NANO", "AI_GPT_5_6_SOL", "AI_GPT_5_6_TERRA", "AI_GPT_5_6_LUNA", "AI_GEMINI_2_5_FLASH", "AI_GEMINI_2_5_PRO", "AI_GEMINI_3_6_FLASH", "AI_GEMINI_3_5_FLASH_LITE", "AI_CLAUDE_OPUS_4_7", "AI_CLAUDE_SONNET_4_6", "AI_CLAUDE_HAIKU_4_5", "AI_CLAUDE_OPUS_5", "AI_CLAUDE_SONNET_5", "AI_MISTRAL_LARGE_3", "AI_MISTRAL_SMALL_4", "AI_MISTRAL_MEDIUM_3_5", "AI_MISTRAL_LARGE_4", "AI_GPT_6_LUNA", "AI_GPT_6_1_TERRA", "AI_GPT_6_1_SOL", "AI_GEMINI_3_8_FLASH", "AI_CLAUDE_OPUS_5_5", "AI_CLAUDE_SONNET_5_5", "AI_CLAUDE_HAIKU_5_5" ],
         "example" : "AI_GPT_5_4",
         "type" : "string"
       },
@@ -22748,12 +22740,6 @@
       "Segment" : {
         "description" : "Shared segment metadata. Keys and their file context are separate key objects; text edits affect every key of the segment.",
         "properties" : {
-          "ai_context" : {
-            "description" : "Shared context for automated translation.",
-            "example" : "Short mobile button label",
-            "nullable" : true,
-            "type" : "string"
-          },
           "created_at" : {
             "description" : "Timestamp when the shared segment was created.",
             "example" : "2026-09-29T00:00:00.123Z",
@@ -22761,7 +22747,7 @@
             "type" : "string"
           },
           "description" : {
-            "description" : "Shared translator-facing description.",
+            "description" : "Shared description for translators; LINA reads it when its segment context is enabled.",
             "example" : "Label on the sign-in button",
             "nullable" : true,
             "type" : "string"
@@ -22818,7 +22804,7 @@
             "type" : "string"
           }
         },
-        "required" : [ "ai_context", "created_at", "description", "id", "is_not_translatable", "is_plural", "label_ids", "not_translatable_reason", "object_type", "stack_id", "updated_at" ],
+        "required" : [ "created_at", "description", "id", "is_not_translatable", "is_plural", "label_ids", "not_translatable_reason", "object_type", "stack_id", "updated_at" ],
         "type" : "object"
       },
       "SegmentCollection" : {
@@ -22827,7 +22813,6 @@
           "data" : {
             "description" : "The list of items in this page.",
             "example" : [ {
-              "ai_context" : "Short mobile button label",
               "created_at" : "2026-09-29T00:00:00.123Z",
               "description" : "Label on the sign-in button",
               "id" : "seg_0197c8f2-5a6b-7cde-8f12-3456789abcde",
@@ -22903,61 +22888,6 @@
             },
             "minItems" : 1,
             "type" : "array"
-          },
-          "segment[ai_context]" : {
-            "additionalProperties" : false,
-            "description" : "Exactly one operator of the field.",
-            "maxProperties" : 1,
-            "minProperties" : 1,
-            "properties" : {
-              "_blank" : {
-                "description" : "Takes no value; send `true`.",
-                "enum" : [ true ],
-                "type" : "boolean"
-              },
-              "_contains" : {
-                "type" : "string"
-              },
-              "_ends" : {
-                "type" : "string"
-              },
-              "_eq" : {
-                "type" : "string"
-              },
-              "_icontains" : {
-                "type" : "string"
-              },
-              "_ilike" : {
-                "type" : "string"
-              },
-              "_like" : {
-                "type" : "string"
-              },
-              "_nblank" : {
-                "description" : "Takes no value; send `true`.",
-                "enum" : [ true ],
-                "type" : "boolean"
-              },
-              "_ncontains" : {
-                "type" : "string"
-              },
-              "_ne" : {
-                "type" : "string"
-              },
-              "_nicontains" : {
-                "type" : "string"
-              },
-              "_nilike" : {
-                "type" : "string"
-              },
-              "_nlike" : {
-                "type" : "string"
-              },
-              "_starts" : {
-                "type" : "string"
-              }
-            },
-            "type" : "object"
           },
           "segment[created_at]" : {
             "additionalProperties" : false,
@@ -29177,7 +29107,7 @@
             "type" : "boolean"
           },
           "is_segments_enabled" : {
-            "description" : "Enable segments context.",
+            "description" : "Whether LINA reads the descriptions of segments.",
             "example" : false,
             "type" : "boolean"
           },
@@ -29297,15 +29227,8 @@
       "UpdateSegment" : {
         "description" : "Request body to partially update shared segment metadata. Omitted fields remain unchanged; nullable strings may be cleared. Changes affect every key of the segment.",
         "properties" : {
-          "ai_context" : {
-            "description" : "Context for AI translation; null clears it.",
-            "example" : "Short button label",
-            "maxLength" : 256,
-            "nullable" : true,
-            "type" : "string"
-          },
           "description" : {
-            "description" : "Shared translator-facing description; null clears it.",
+            "description" : "Shared description for translators; LINA reads it when its segment context is enabled. Null clears it.",
             "example" : "Label on the sign-in button",
             "nullable" : true,
             "type" : "string"
@@ -45392,7 +45315,7 @@
               }
             }
           },
-          "description" : "Filters and sorts the list: URL-encoded JSON of the schema `SegmentFilter`. `where` holds exactly one `_and` or `_or` with an array of clauses; a clause is another `_and`/`_or` or a field with exactly one operator. `sort` lists fields with `+` (ascending) or `-` (descending). An unsupported field, operator or value answers `400 invalid_filter` with a pointer into the filter.\n\n| Field | Type | Operators | Sort |\n|---|---|---|---|\n| `segment[ai_context]` | text | `_eq` `_ne` `_like` `_nlike` `_ilike` `_nilike` `_contains` `_ncontains` `_icontains` `_nicontains` `_starts` `_ends` `_blank` `_nblank` | – |\n| `segment[created_at]` | timestamp | `_eq` `_lt` `_gt` `_lte` `_gte` `_within` `_null` `_nnull` | yes |\n| `segment[description]` | text | `_eq` `_ne` `_like` `_nlike` `_ilike` `_nilike` `_contains` `_ncontains` `_icontains` `_nicontains` `_starts` `_ends` `_blank` `_nblank` | – |\n| `segment[id]` | id | `_eq` `_ne` `_in` `_nin` | – |\n| `segment[is_plural]` | boolean | `_true` `_false` | – |\n| `segment[updated_at]` | timestamp | `_eq` `_lt` `_gt` `_lte` `_gte` `_within` `_null` `_nnull` | yes |\n",
+          "description" : "Filters and sorts the list: URL-encoded JSON of the schema `SegmentFilter`. `where` holds exactly one `_and` or `_or` with an array of clauses; a clause is another `_and`/`_or` or a field with exactly one operator. `sort` lists fields with `+` (ascending) or `-` (descending). An unsupported field, operator or value answers `400 invalid_filter` with a pointer into the filter.\n\n| Field | Type | Operators | Sort |\n|---|---|---|---|\n| `segment[created_at]` | timestamp | `_eq` `_lt` `_gt` `_lte` `_gte` `_within` `_null` `_nnull` | yes |\n| `segment[description]` | text | `_eq` `_ne` `_like` `_nlike` `_ilike` `_nilike` `_contains` `_ncontains` `_icontains` `_nicontains` `_starts` `_ends` `_blank` `_nblank` | – |\n| `segment[id]` | id | `_eq` `_ne` `_in` `_nin` | – |\n| `segment[is_plural]` | boolean | `_true` `_false` | – |\n| `segment[updated_at]` | timestamp | `_eq` `_lt` `_gt` `_lte` `_gte` `_within` `_null` `_nnull` | yes |\n",
           "in" : "query",
           "name" : "filter",
           "required" : false
@@ -72764,7 +72687,7 @@
               }
             }
           },
-          "description" : "Filters and sorts the list: URL-encoded JSON of the schema `LinguisticEngineFilter`. `where` holds exactly one `_and` or `_or` with an array of clauses; a clause is another `_and`/`_or` or a field with exactly one operator. `sort` lists fields with `+` (ascending) or `-` (descending). An unsupported field, operator or value answers `400 invalid_filter` with a pointer into the filter.\n\n| Field | Type | Operators | Sort |\n|---|---|---|---|\n| `linguistic_engine[created_at]` | timestamp | `_eq` `_lt` `_gt` `_lte` `_gte` `_within` `_null` `_nnull` | yes |\n| `linguistic_engine[id]` | id | `_eq` `_ne` `_in` `_nin` | – |\n| `linguistic_engine[model]` | MT_GOOGLE_TRANSLATE_V3 \\| MT_DEEPL_TRANSLATE_V1 \\| MT_AWS_TRANSLATE \\| AI_GPT_5_4 \\| AI_GPT_5_4_MINI \\| AI_GPT_5_4_NANO \\| AI_GPT_5_6_SOL \\| AI_GPT_5_6_TERRA \\| AI_GPT_5_6_LUNA \\| AI_GEMINI_2_5_FLASH \\| AI_GEMINI_2_5_PRO \\| AI_GEMINI_3_6_FLASH \\| AI_GEMINI_3_5_FLASH_LITE \\| AI_CLAUDE_OPUS_4_7 \\| AI_CLAUDE_SONNET_4_6 \\| AI_CLAUDE_HAIKU_4_5 \\| AI_CLAUDE_OPUS_5 \\| AI_CLAUDE_SONNET_5 \\| AI_MISTRAL_LARGE_3 \\| AI_MISTRAL_SMALL_4 \\| AI_MISTRAL_MEDIUM_3_5 \\| AI_MISTRAL_LARGE_4 | `_eq` `_ne` `_in` `_nin` | – |\n| `linguistic_engine[updated_at]` | timestamp | `_eq` `_lt` `_gt` `_lte` `_gte` `_within` `_null` `_nnull` | yes |\n",
+          "description" : "Filters and sorts the list: URL-encoded JSON of the schema `LinguisticEngineFilter`. `where` holds exactly one `_and` or `_or` with an array of clauses; a clause is another `_and`/`_or` or a field with exactly one operator. `sort` lists fields with `+` (ascending) or `-` (descending). An unsupported field, operator or value answers `400 invalid_filter` with a pointer into the filter.\n\n| Field | Type | Operators | Sort |\n|---|---|---|---|\n| `linguistic_engine[created_at]` | timestamp | `_eq` `_lt` `_gt` `_lte` `_gte` `_within` `_null` `_nnull` | yes |\n| `linguistic_engine[id]` | id | `_eq` `_ne` `_in` `_nin` | – |\n| `linguistic_engine[model]` | MT_GOOGLE_TRANSLATE_V3 \\| MT_DEEPL_TRANSLATE_V1 \\| MT_AWS_TRANSLATE \\| AI_GPT_5_4 \\| AI_GPT_5_4_MINI \\| AI_GPT_5_4_NANO \\| AI_GPT_5_6_SOL \\| AI_GPT_5_6_TERRA \\| AI_GPT_5_6_LUNA \\| AI_GEMINI_2_5_FLASH \\| AI_GEMINI_2_5_PRO \\| AI_GEMINI_3_6_FLASH \\| AI_GEMINI_3_5_FLASH_LITE \\| AI_CLAUDE_OPUS_4_7 \\| AI_CLAUDE_SONNET_4_6 \\| AI_CLAUDE_HAIKU_4_5 \\| AI_CLAUDE_OPUS_5 \\| AI_CLAUDE_SONNET_5 \\| AI_MISTRAL_LARGE_3 \\| AI_MISTRAL_SMALL_4 \\| AI_MISTRAL_MEDIUM_3_5 \\| AI_MISTRAL_LARGE_4 \\| AI_GPT_6_LUNA \\| AI_GPT_6_1_TERRA \\| AI_GPT_6_1_SOL \\| AI_GEMINI_3_8_FLASH \\| AI_CLAUDE_OPUS_5_5 \\| AI_CLAUDE_SONNET_5_5 \\| AI_CLAUDE_HAIKU_5_5 | `_eq` `_ne` `_in` `_nin` | – |\n| `linguistic_engine[updated_at]` | timestamp | `_eq` `_lt` `_gt` `_lte` `_gte` `_within` `_null` `_nnull` | yes |\n",
           "in" : "query",
           "name" : "filter",
           "required" : false
@@ -98309,7 +98232,7 @@
         "tags" : [ "Segments" ]
       },
       "patch" : {
-        "description" : "Updates shared metadata using JSON merge-patch. Changes affect every key of the segment. Omitted fields remain unchanged; null clears description or AI context, and an empty label_ids array clears labels. Plural changes must be supported by every active file format; becoming singular retains current OTHER-form texts and removes all other current plural forms across all languages. Supports optional If-Match. Requires stack-level segment management permission.",
+        "description" : "Updates shared metadata using JSON merge-patch. Changes affect every key of the segment. Omitted fields remain unchanged; null clears the description, and an empty label_ids array clears labels. Plural changes must be supported by every active file format; becoming singular retains current OTHER-form texts and removes all other current plural forms across all languages. Supports optional If-Match. Requires stack-level segment management permission.",
         "operationId" : "updateSegment",
         "parameters" : [ {
           "description" : "Public identifier of the shared segment.",
