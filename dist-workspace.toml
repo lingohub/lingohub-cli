@@ -34,6 +34,10 @@ github-attestations = true
 # Whether to install an updater program
 install-updater = false
 
-# Build ARM64 Linux natively instead of cross-compiling the C TLS library.
+# Build ARM64 Linux natively instead of cross-compiling the C TLS library. The other Linux jobs
+# leave dist's ubuntu-22.04 default, which GitHub removes on 2027-04-17; the Linux builds are
+# static musl, so the runner's glibc does not limit which distributions the binary supports.
 [dist.github-custom-runners]
+global = "ubuntu-24.04"
 aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
+x86_64-unknown-linux-musl = "ubuntu-24.04"
