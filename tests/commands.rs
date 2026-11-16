@@ -7897,26 +7897,15 @@ fn mcp_stdio_keeps_json_query_content_encoded_and_refuses_commas_inside_list_ite
     let requests = stub.finish();
     assert_eq!(requests.len(), 1, "the refused call must not reach the API");
     let line = requests[0].lines().next().unwrap();
-    let query = line.split_once('?').unwrap().1.split(' ').next().unwrap();
-    assert!(query.split('&').any(|pair| pair == "limit=2"), "{line}");
-    let encoded = query
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("filter="))
-        .unwrap();
-    // Decode the percent-encoding by hand: the test crate has no URL dependency.
-    let mut bytes = Vec::new();
-    let mut rest = encoded.as_bytes();
-    while let Some((&byte, tail)) = rest.split_first() {
-        if byte == b'%' {
-            let hex = std::str::from_utf8(&tail[..2]).unwrap();
-            bytes.push(u8::from_str_radix(hex, 16).unwrap());
-            rest = &tail[2..];
-        } else {
-            bytes.push(if byte == b'+' { b' ' } else { byte });
-            rest = tail;
-        }
-    }
-    let sent = &String::from_utf8(bytes).unwrap();
+    let target = line.split(' ').nth(1).unwrap();
+    let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+    let value = |name: &str| {
+        url.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+    };
+    assert_eq!(value("limit").as_deref(), Some("2"), "{line}");
+    let sent = &value("filter").unwrap();
     assert_eq!(serde_json::from_str::<Value>(sent).unwrap(), filter);
 }
 
