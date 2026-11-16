@@ -16,13 +16,6 @@ pub enum Error {
     Network(String),
     Input(String),
     Protocol(String),
-    BulkIncomplete {
-        succeeded: usize,
-        failed: usize,
-        unknown: usize,
-        not_processed: usize,
-        unrecognized: usize,
-    },
     TranslationIncomplete {
         succeeded: usize,
         failed: usize,
@@ -63,17 +56,6 @@ impl Error {
                 request_id,
                 retry_after,
             } => json!({"status":status,"problem":problem,"request_id":request_id,"retry_after":retry_after}),
-            Self::BulkIncomplete {
-                succeeded,
-                failed,
-                unknown,
-                not_processed,
-                unrecognized,
-            } => json!({
-                "error": "bulk_incomplete", "succeeded": succeeded, "failed": failed,
-                "unknown": unknown, "not_processed": not_processed, "unrecognized": unrecognized,
-                "detail": self.to_string()
-            }),
             Self::TranslationIncomplete { succeeded, failed } => {
                 json!({"error":"translation_incomplete", "succeeded":succeeded, "failed":failed, "detail":self.to_string()})
             }
@@ -137,19 +119,9 @@ impl fmt::Display for Error {
                 Ok(())
             }
             Self::Network(s) | Self::Input(s) | Self::Protocol(s) => f.write_str(s),
-            Self::BulkIncomplete {
-                succeeded,
-                failed,
-                unknown,
-                not_processed,
-                unrecognized,
-            } => write!(
-                f,
-                "Bulk result: {succeeded} succeeded, {failed} failed, {unknown} unknown, {not_processed} not processed, {unrecognized} unrecognized. Successful items are already committed. Full results are on stdout. Reconcile uncertain outcomes before starting new work; no items were automatically retried."
-            ),
             Self::TranslationIncomplete { succeeded, failed } => write!(
                 f,
-                "Translation result: {succeeded} succeeded, {failed} failed. Full keyed results are on stdout. Completed work may have consumed credits; retry only deliberately selected unfinished inputs. No inputs were automatically retried."
+                "Translation result: {succeeded} succeeded, {failed} failed. Full results are on stdout, in the order of the input texts. Completed work may have consumed credits; retry only deliberately selected unfinished inputs. No inputs were automatically retried."
             ),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Json(e) => write!(f, "JSON error: {e}"),

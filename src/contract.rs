@@ -25,27 +25,68 @@ pub fn operations() -> Value {
     Value::Array(operations)
 }
 
-#[derive(Clone, Copy)]
+/// Follow `$ref` chains to the shared header, response, parameter or schema they name.
+/// Returns `None` for external, unresolved or cyclic references.
+pub fn dereference<'a>(spec: &'a Value, mut value: &'a Value) -> Option<&'a Value> {
+    let mut seen = HashSet::new();
+    while let Some(reference) = value.get("$ref").and_then(Value::as_str) {
+        if !seen.insert(reference) {
+            return None;
+        }
+        value = reference
+            .strip_prefix('#')
+            .filter(|pointer| pointer.starts_with('/'))
+            .and_then(|pointer| spec.pointer(pointer))?;
+    }
+    Some(value)
+}
+
+/// Batches are atomic: a success lists one changed resource per submitted item, in order.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BulkResultKind {
     KeyCreation,
-    TextMutation,
+    SegmentMutation,
     Unknown,
 }
 
 impl BulkResultKind {
-    pub fn accepts_success(self, status: u64, object_type: &str) -> bool {
+    /// The `object_type` every listed resource must carry; `None` rejects unadapted schemas.
+    pub fn object_type(self) -> Option<&'static str> {
         match self {
-            Self::KeyCreation => status == 201 && object_type == "KEY",
-            Self::TextMutation => status == 200 && object_type == "TEXT",
-            Self::Unknown => false,
+            Self::KeyCreation => Some("KEY"),
+            Self::SegmentMutation => Some("SEGMENT"),
+            Self::Unknown => None,
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ExpectedResponse {
     Bulk(BulkResultKind),
     LinaTranslation,
+}
+
+/// Classify a success schema: unpaged lists are batch results, paged collections are not.
+fn expected_schema(spec: &Value, schema: &Value) -> Option<ExpectedResponse> {
+    let reference = schema.get("$ref").and_then(Value::as_str);
+    let resolved = dereference(spec, schema)?;
+    let discriminator = resolved
+        .pointer("/properties/object_type/enum")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 1)
+        .and_then(|values| values[0].as_str());
+    match discriminator {
+        Some("LINA_TRANSLATE_RESULT") => Some(ExpectedResponse::LinaTranslation),
+        Some("LIST") if resolved.pointer("/properties/has_more").is_none() => {
+            Some(ExpectedResponse::Bulk(match reference {
+                Some("#/components/schemas/KeyList") => BulkResultKind::KeyCreation,
+                Some("#/components/schemas/SegmentList") => BulkResultKind::SegmentMutation,
+                _ => BulkResultKind::Unknown,
+            }))
+        }
+        Some("BULK_RESULT") => Some(ExpectedResponse::Bulk(BulkResultKind::Unknown)),
+        _ => None,
+    }
 }
 
 /// Resolve operation-specific result validation for both named and raw requests.
@@ -70,26 +111,8 @@ pub fn expected_response(method: &str, path: &str) -> Option<ExpectedResponse> {
                 if !status.starts_with('2') {
                     return None;
                 }
-                let schema = &response["content"]["application/json"]["schema"];
-                let reference = schema.get("$ref").and_then(Value::as_str);
-                let resolved = reference
-                    .and_then(|value| value.strip_prefix('#'))
-                    .and_then(|pointer| spec.pointer(pointer))
-                    .unwrap_or(schema);
-                let discriminator = resolved
-                    .pointer("/properties/object_type/enum")
-                    .and_then(Value::as_array)
-                    .filter(|values| values.len() == 1)
-                    .and_then(|values| values[0].as_str());
-                match discriminator {
-                    Some("LINA_TRANSLATE_RESULT") => Some(ExpectedResponse::LinaTranslation),
-                    Some("BULK_RESULT") => Some(ExpectedResponse::Bulk(match reference {
-                        Some("#/components/schemas/KeyBulkResult") => BulkResultKind::KeyCreation,
-                        Some("#/components/schemas/TextBulkResult") => BulkResultKind::TextMutation,
-                        _ => BulkResultKind::Unknown,
-                    })),
-                    _ => None,
-                }
+                let response = dereference(spec, response)?;
+                expected_schema(spec, &response["content"]["application/json"]["schema"])
             })
         })
 }
@@ -192,13 +215,56 @@ mod tests {
 
     #[test]
     fn every_bundled_bulk_schema_has_an_outcome_adapter() {
-        for (name, schema) in specification()["components"]["schemas"].as_object().unwrap() {
-            if schema.pointer("/properties/object_type/enum") == Some(&json!(["BULK_RESULT"])) {
+        let spec = specification();
+        let mut adapted = 0;
+        for (name, schema) in spec["components"]["schemas"].as_object().unwrap() {
+            let reference = json!({"$ref": format!("#/components/schemas/{name}")});
+            if let Some(ExpectedResponse::Bulk(kind)) = expected_schema(spec, &reference) {
                 assert!(
-                    matches!(name.as_str(), "KeyBulkResult" | "TextBulkResult"),
+                    kind != BulkResultKind::Unknown,
                     "Add an outcome adapter before exposing bulk schema {name}"
                 );
+                assert!(schema.pointer("/properties/data/items").is_some());
+                adapted += 1;
             }
         }
+        assert_eq!(2, adapted);
+        for (method, path, kind) in [
+            (
+                "POST",
+                "/v2/resources/rc_1/keys/bulk-create",
+                BulkResultKind::KeyCreation,
+            ),
+            (
+                "POST",
+                "/v2/branches/prb_1/segments/bulk-update",
+                BulkResultKind::SegmentMutation,
+            ),
+            (
+                "POST",
+                "/v2/branches/prb_1/segments/bulk-transition",
+                BulkResultKind::SegmentMutation,
+            ),
+        ] {
+            assert_eq!(
+                Some(ExpectedResponse::Bulk(kind)),
+                expected_response(method, path)
+            );
+        }
+        assert_eq!(None, expected_response("GET", "/v2/branches/prb_1/segments"));
+    }
+
+    #[test]
+    fn shared_response_and_header_references_resolve_and_cycles_do_not() {
+        let spec = specification();
+        let operation = &spec["paths"]["/v2/segments/{segmentId}"]["get"];
+        let missing = dereference(spec, &operation["responses"]["404"]).unwrap();
+        assert!(missing["content"]["application/problem+json"]["schema"].is_object());
+        let etag = dereference(spec, &operation["responses"]["200"]["headers"]["ETag"]).unwrap();
+        assert_eq!("string", etag["schema"]["type"]);
+        let cyclic = json!({"a":{"$ref":"#/b"},"b":{"$ref":"#/a"}});
+        assert!(dereference(&cyclic, &cyclic["a"]).is_none());
+        assert!(dereference(spec, &json!({"$ref":"https://example.test/x"})).is_none());
+        assert!(dereference(spec, &json!({"$ref":"#/components/responses/Missing"})).is_none());
     }
 }

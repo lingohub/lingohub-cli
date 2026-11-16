@@ -134,42 +134,33 @@ pub fn print_expected_response(
     validate_expected_body(response.body.as_ref(), expected, input)
 }
 
-/// Check outcomes independently of output so CLI and MCP report the same partial failures.
+/// Check outcomes independently of output so CLI and MCP report the same result problems.
 pub fn validate_expected_body(
     body: Option<&Value>,
     expected: Option<ExpectedResponse>,
     input: Option<&Value>,
 ) -> Result<(), Error> {
-    let bulk = match expected {
-        Some(ExpectedResponse::Bulk(kind)) => Some(kind),
-        _ => None,
-    };
-    if let Some(body) = body {
-        if bulk.is_some() && body.get("object_type").and_then(Value::as_str) != Some("BULK_RESULT") {
-            return Err(Error::Protocol("Expected a BULK_RESULT response. Inspect the full response and reconcile affected resources before retrying.".into()));
+    match (expected, body) {
+        (None, _) => Ok(()),
+        (Some(ExpectedResponse::Bulk(kind)), Some(body)) => require_bulk_list(body, kind, input),
+        (Some(ExpectedResponse::LinaTranslation), Some(body)) => {
+            require_lina_translation_success(body, input)
         }
-        if bulk.is_some() {
-            require_bulk_correlation(body, input)?;
+        (Some(expected), None) => {
+            let kind = match expected {
+                ExpectedResponse::Bulk(_) => "bulk LIST",
+                ExpectedResponse::LinaTranslation => "LINA_TRANSLATE_RESULT",
+            };
+            Err(Error::Protocol(format!(
+                "Expected a {kind} response, but the server returned no body. Reconcile uncertain outcomes before retrying."
+            )))
         }
-        require_bulk_success(body, bulk)?;
-        if matches!(expected, Some(ExpectedResponse::LinaTranslation)) {
-            require_lina_translation_success(body, input)?;
-        }
-    } else if let Some(expected) = expected {
-        let kind = match expected {
-            ExpectedResponse::Bulk(_) => "BULK_RESULT",
-            ExpectedResponse::LinaTranslation => "LINA_TRANSLATE_RESULT",
-        };
-        return Err(Error::Protocol(format!(
-            "Expected a {kind} response, but the server returned no body. Reconcile uncertain outcomes before retrying."
-        )));
     }
-    Ok(())
 }
 
 fn require_lina_translation_success(body: &Value, input: Option<&Value>) -> Result<(), Error> {
     let malformed = || {
-        Error::Protocol("Malformed LINA_TRANSLATE_RESULT: expected one result per input key and a consistent overall status. Inspect the full response; inspect it before retrying.".into())
+        Error::Protocol("Malformed LINA_TRANSLATE_RESULT: expected one result per input text, in request order, and a consistent overall status. Inspect the full response; inspect it before retrying.".into())
     };
     let expected = input
         .and_then(|x| x.get("texts"))
@@ -184,10 +175,8 @@ fn require_lina_translation_success(body: &Value, input: Option<&Value>) -> Resu
         return Err(malformed());
     }
     let mut succeeded = 0;
-    for (result, source) in results.iter().zip(expected) {
-        if source.get("key").and_then(Value::as_str).is_none() || result.get("key") != source.get("key") {
-            return Err(malformed());
-        }
+    // Results carry no identity of their own: `results[i]` belongs to `texts[i]`.
+    for result in results {
         match result.get("is_translated").and_then(Value::as_bool) {
             Some(true) if result.get("text").and_then(Value::as_str).is_some() => succeeded += 1,
             Some(false) if result.get("text").is_some_and(Value::is_null) => (),
@@ -217,130 +206,35 @@ fn require_lina_translation_success(body: &Value, input: Option<&Value>) -> Resu
     }
 }
 
-fn require_bulk_correlation(body: &Value, input: Option<&Value>) -> Result<(), Error> {
+/// A batch commits all items or none, so success must list one resource per submitted item.
+fn require_bulk_list(body: &Value, kind: BulkResultKind, input: Option<&Value>) -> Result<(), Error> {
     let malformed = || {
-        Error::Protocol("Malformed BULK_RESULT: results must match every submitted item's index and reference exactly. Inspect the full response; reconcile affected resources before retrying.".into())
+        Error::Protocol("Malformed bulk result: expected a LIST with one resource of the operation's type per submitted item, in request order. The batch may be committed. Inspect the full response; reconcile affected resources before retrying.".into())
     };
-    let expected = input
+    let object_type = kind.object_type().ok_or_else(malformed)?;
+    let submitted = input
         .and_then(|value| value.get("items"))
         .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
         .ok_or_else(malformed)?;
     let results = body.get("data").and_then(Value::as_array).ok_or_else(malformed)?;
-    if results.len() != expected.len() {
+    if body.get("object_type").and_then(Value::as_str) != Some("LIST") || results.len() != submitted.len() {
         return Err(malformed());
     }
-    for (index, (result, item)) in results.iter().zip(expected).enumerate() {
-        let reference = item
-            .get("reference")
+    for (result, item) in results.iter().zip(submitted) {
+        let id = result
+            .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(malformed)?;
-        if result.get("index").and_then(Value::as_u64) != Some(index as u64)
-            || result.get("reference").and_then(Value::as_str) != Some(reference)
-        {
+            .filter(|id| !id.is_empty());
+        if result.get("object_type").and_then(Value::as_str) != Some(object_type) || id.is_none() {
+            return Err(malformed());
+        }
+        // Segment batches name their targets; created keys receive new identities.
+        if kind == BulkResultKind::SegmentMutation && item.get("segment_id").and_then(Value::as_str) != id {
             return Err(malformed());
         }
     }
     Ok(())
-}
-
-fn require_bulk_success(body: &Value, bulk: Option<BulkResultKind>) -> Result<(), Error> {
-    if body.get("object_type").and_then(Value::as_str) != Some("BULK_RESULT") {
-        return Ok(());
-    }
-    let malformed = || {
-        Error::Protocol(
-        "Malformed BULK_RESULT: expected a nonempty data array with an outcome string per item. Inspect the full response; reconcile affected resources before retrying.".into()
-    )
-    };
-    let items = body
-        .get("data")
-        .and_then(Value::as_array)
-        .filter(|items| !items.is_empty())
-        .ok_or_else(malformed)?;
-    let (mut succeeded, mut failed, mut unknown, mut not_processed, mut unrecognized) = (0, 0, 0, 0, 0);
-    for item in items {
-        require_bulk_item_shape(item, bulk)?;
-        match item
-            .get("outcome")
-            .and_then(Value::as_str)
-            .ok_or_else(malformed)?
-        {
-            "SUCCEEDED" => succeeded += 1,
-            "FAILED" => failed += 1,
-            "UNKNOWN" => unknown += 1,
-            "NOT_PROCESSED" => not_processed += 1,
-            _ => unrecognized += 1,
-        }
-    }
-    if succeeded == items.len() {
-        Ok(())
-    } else {
-        Err(Error::BulkIncomplete {
-            succeeded,
-            failed,
-            unknown,
-            not_processed,
-            unrecognized,
-        })
-    }
-}
-
-fn require_bulk_item_shape(item: &Value, bulk: Option<BulkResultKind>) -> Result<(), Error> {
-    let malformed = || {
-        Error::Protocol("Malformed BULK_RESULT item: required fields or outcome-specific result types are invalid. Inspect the full response; reconcile affected resources before retrying.".into())
-    };
-    if [
-        "index",
-        "reference",
-        "outcome",
-        "status",
-        "data",
-        "error",
-        "location",
-        "etag",
-    ]
-    .iter()
-    .any(|field| item.get(field).is_none())
-        || item["index"].as_u64().is_none()
-        || item["reference"].as_str().is_none()
-    {
-        return Err(malformed());
-    }
-    let nonempty = |value: &Value| value.as_str().is_some_and(|text| !text.is_empty());
-    let empty_result = || item["data"].is_null() && item["location"].is_null() && item["etag"].is_null();
-    let valid = match item["outcome"].as_str() {
-        Some("SUCCEEDED") => {
-            bulk.is_some_and(|kind| {
-                item["status"]
-                    .as_u64()
-                    .zip(item["data"]["object_type"].as_str())
-                    .is_some_and(|(status, object_type)| kind.accepts_success(status, object_type))
-            }) && item["data"].is_object()
-                && nonempty(&item["data"]["id"])
-                && nonempty(&item["data"]["object_type"])
-                && item["error"].is_null()
-                && nonempty(&item["location"])
-                && nonempty(&item["etag"])
-        }
-        Some("FAILED" | "UNKNOWN") => {
-            let range = if item["outcome"] == "FAILED" {
-                400..500
-            } else {
-                500..600
-            };
-            item["status"]
-                .as_u64()
-                .is_some_and(|status| range.contains(&status))
-                && empty_result()
-                && item["error"].is_object()
-                && item["error"]["status"] == item["status"]
-                && nonempty(&item["error"]["code"])
-        }
-        Some("NOT_PROCESSED") => item["status"].is_null() && item["error"].is_null() && empty_result(),
-        Some(_) => true, // Preserve unknown future results, but they still produce a nonzero exit.
-        None => false,
-    };
-    if valid { Ok(()) } else { Err(malformed()) }
 }
 
 pub fn print_headers(response: &ApiResponse) {

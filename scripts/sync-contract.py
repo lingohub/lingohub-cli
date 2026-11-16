@@ -42,7 +42,7 @@ for path, item in spec["paths"].items():
         support = "JSON operation call" if supported else ("Multipart operation upload" if "multipart/form-data" in media else "Pending binary workflow")
         if op["operationId"] == "getExport":
             support += "; completed artifact download"
-        if op["operationId"] == "getDistributionReleaseDownload":
+        if op["operationId"] == "getDistributionRelease":
             support += "; completed release archive download"
         if op["operationId"] == "listExportEntries":
             support += "; individual entry download"

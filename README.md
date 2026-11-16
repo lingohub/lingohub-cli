@@ -148,8 +148,9 @@ PATCH uses JSON merge-patch: omitted fields stay unchanged, null is explicit.
 Read-only resource commands and offline commands reject unsupported body/write flags.
 
 Exit **0** means success, **1** means API/network/protocol failure or an incomplete
-bulk/translation/job outcome, and **2** means invalid input. A partial operation
+translation/job outcome, and **2** means invalid input. A partial translation
 can print its full response and still exit 1; inspect every item before retrying.
+Batch operations are atomic: they change every item or none.
 Empty successful responses produce no invented JSON. Human resource views use aligned labels, colors and `—` for null values. Collection
 headings show the number returned, not an invented total or page number. Other
 operations retain generic field output; use `--json` for complete wire values in scripts.
@@ -164,9 +165,9 @@ lingohub stack list --limit 20 --json
 lingohub stack list --cursor 'OPAQUE_CURSOR' --json
 lingohub project get pr_UUID --include-headers --json
 lingohub project update pr_UUID --field 'name="Updated"' --if-match '"ETAG"' --json
-lingohub api call getText --path textId=txt_UUID --json
-lingohub api call listTexts --path branchId=prb_UUID --query limit=20 --json
-lingohub api request GET /v2/capabilities --json
+lingohub api call getSegment --path segmentId=seg_UUID --query language_codes=en,de --json
+lingohub api call listSegments --path branchId=prb_UUID --query limit=20 --json
+lingohub api request GET /v2/projects/pr_UUID/capabilities --json
 ```
 
 Resource lists return one cursor page by default; `--all` combines pages into an
@@ -174,8 +175,8 @@ array. Generic `api call` and `api request` always send one request: follow a
 `next_cursor` with `--query cursor=VALUE`. Interactive selection loads the next
 page only when requested.
 
-Create requests use the bundled schemas. For example, a stack needs `name`,
-`color` and `type`; a project needs `name`, `type`, `source_language_code` and
+Create requests use the bundled schemas. For example, a stack needs `name` and
+`source_language_code`; a project needs `name`, `type`, `source_language_code` and
 `target_language_codes`. Supply JSON with `--file` or use terminal prompts.
 
 The [operation inventory](docs/operations.md) covers every bundled route. The
@@ -199,6 +200,9 @@ lingohub api download-export reg_UUID --output ./export.zip --json
 the terminal state, or the last pending state on timeout, with a nonzero exit for
 failure/incomplete outcomes. It does not submit or restart a job.
 
+`api download-distribution-release RELEASE_ID --output PATH` saves the archive of a
+succeeded release from the signed link on the release itself.
+
 Downloads refresh API metadata, then use an unauthenticated artifact client. They
 never forward the API token, follow redirects or overwrite an existing destination.
 Use `--max-bytes` to bound downloads and `--max-pages` for export-entry lookup.
@@ -208,7 +212,7 @@ On an expired link, rerun to fetch fresh metadata.
 
 ```sh
 lingohub api mcp-tools
-lingohub api mcp-tools --operation getProject --operation setProjectKeySettings
+lingohub api mcp-tools --operation getProject --operation updateProjectSettings
 lingohub api mcp-tools --tag 'Project Settings'
 lingohub api mcp-serve
 ```
@@ -226,8 +230,8 @@ stdio server. Supply credentials in the MCP host's environment:
 
 Tool arguments cannot change the API origin or credential. Only `If-Match` and
 `Idempotency-Key` headers are accepted. Each tool call sends one API request and
-returns status, selected headers and the full body. Partial bulk/translation
-outcomes and API failures set `isError`. Poll jobs explicitly. Selected tools
+returns status, selected headers and the full body. Partial translation
+outcomes, malformed batch results and API failures set `isError`. Poll jobs explicitly. Selected tools
 remain subject to the API key's current permissions.
 
 ## Request boundaries

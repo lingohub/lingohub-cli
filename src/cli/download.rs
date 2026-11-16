@@ -144,7 +144,7 @@ pub async fn run_entry(
     ))
 }
 
-/// Refresh a release's computed download subresource without changing its metadata validator.
+/// Re-read a release for the fresh signed archive link it carries once it has succeeded.
 pub async fn run_release(
     client: &ApiClient,
     release_id: &str,
@@ -153,7 +153,7 @@ pub async fn run_release(
     cli: &Cli,
 ) -> Result<(), Error> {
     let (_, path) = contract::resolve(
-        "getDistributionReleaseDownload",
+        "getDistributionRelease",
         &[("distributionReleaseId".into(), release_id.into())],
     )?;
     let mut pending = PendingFile::create(Path::new(destination))?;
@@ -164,22 +164,40 @@ pub async fn run_release(
         output::print_headers(&metadata);
     }
     if metadata.status != 200 {
-        return Err(Error::Protocol("Expected HTTP 200 download metadata".into()));
+        return Err(Error::Protocol(
+            "Expected HTTP 200 distribution release metadata".into(),
+        ));
     }
     let body = metadata
         .body
-        .ok_or_else(|| Error::Protocol("Expected distribution release download metadata".into()))?;
-    if body["object_type"].as_str() != Some("DISTRIBUTION_RELEASE_DOWNLOAD")
-        || body["id"].as_str() != Some(release_id)
+        .ok_or_else(|| Error::Protocol("Expected distribution release metadata".into()))?;
+    if body["object_type"].as_str() != Some("DISTRIBUTION_RELEASE") || body["id"].as_str() != Some(release_id)
     {
         return Err(Error::Protocol(
-            "Download metadata does not match the requested distribution release".into(),
+            "Release metadata does not match the requested distribution release".into(),
         ));
+    }
+    match body["status"].as_str() {
+        Some("SUCCEEDED") => (),
+        Some("PROCESSING") => {
+            return Err(Error::Protocol(
+                "Distribution release is not finished; inspect its status before downloading".into(),
+            ));
+        }
+        Some("FAILED") => {
+            return Err(Error::Protocol(
+                "Distribution release did not succeed; inspect its export before downloading".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::Protocol(
+                "Distribution release has an unrecognized status".into(),
+            ));
+        }
     }
     let link = body.get("download_url").and_then(Value::as_str).ok_or_else(|| {
         Error::Protocol(
-            "No completed archive is available; inspect the distribution release status before downloading"
-                .into(),
+            "No completed archive is available; inspect the distribution release before downloading".into(),
         )
     })?;
     let url = artifact_url(Some(link))?;
