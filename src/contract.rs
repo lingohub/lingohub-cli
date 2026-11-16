@@ -66,27 +66,47 @@ pub enum ExpectedResponse {
     LinaTranslation,
 }
 
-/// Classify a success schema: unpaged lists are batch results, paged collections are not.
-fn expected_schema(spec: &Value, schema: &Value) -> Option<ExpectedResponse> {
+/// The batch operations and the list schema each returns on success. Batch semantics belong to
+/// these operations, not to the shape of a response: an unpaged list from any other operation is
+/// an ordinary read.
+const BULK_OPERATIONS: [(&str, &str, BulkResultKind); 3] = [
+    (
+        "createKeysBulk",
+        "#/components/schemas/KeyList",
+        BulkResultKind::KeyCreation,
+    ),
+    (
+        "updateSegmentsBulk",
+        "#/components/schemas/SegmentList",
+        BulkResultKind::SegmentMutation,
+    ),
+    (
+        "transitionSegmentsBulk",
+        "#/components/schemas/SegmentList",
+        BulkResultKind::SegmentMutation,
+    ),
+];
+
+/// Classify an operation's success schema. A batch operation whose declared schema is not the
+/// adapted one is `Unknown`, which rejects its results until an adapter exists.
+fn expected_schema(spec: &Value, operation: &Value, schema: &Value) -> Option<ExpectedResponse> {
     let reference = schema.get("$ref").and_then(Value::as_str);
-    let resolved = dereference(spec, schema)?;
-    let discriminator = resolved
+    if let Some((_, adapted, kind)) = BULK_OPERATIONS
+        .iter()
+        .find(|(id, _, _)| operation["operationId"].as_str() == Some(id))
+    {
+        return Some(ExpectedResponse::Bulk(if reference == Some(adapted) {
+            *kind
+        } else {
+            BulkResultKind::Unknown
+        }));
+    }
+    let discriminator = dereference(spec, schema)?
         .pointer("/properties/object_type/enum")
         .and_then(Value::as_array)
         .filter(|values| values.len() == 1)
         .and_then(|values| values[0].as_str());
-    match discriminator {
-        Some("LINA_TRANSLATE_RESULT") => Some(ExpectedResponse::LinaTranslation),
-        Some("LIST") if resolved.pointer("/properties/has_more").is_none() => {
-            Some(ExpectedResponse::Bulk(match reference {
-                Some("#/components/schemas/KeyList") => BulkResultKind::KeyCreation,
-                Some("#/components/schemas/SegmentList") => BulkResultKind::SegmentMutation,
-                _ => BulkResultKind::Unknown,
-            }))
-        }
-        Some("BULK_RESULT") => Some(ExpectedResponse::Bulk(BulkResultKind::Unknown)),
-        _ => None,
-    }
+    (discriminator == Some("LINA_TRANSLATE_RESULT")).then_some(ExpectedResponse::LinaTranslation)
 }
 
 /// Resolve operation-specific result validation for both named and raw requests.
@@ -106,13 +126,18 @@ pub fn expected_response(method: &str, path: &str) -> Option<ExpectedResponse> {
             {
                 return None;
             }
-            let responses = item.get(method.to_ascii_lowercase())?["responses"].as_object()?;
+            let operation = item.get(method.to_ascii_lowercase())?;
+            let responses = operation["responses"].as_object()?;
             responses.iter().find_map(|(status, response)| {
                 if !status.starts_with('2') {
                     return None;
                 }
                 let response = dereference(spec, response)?;
-                expected_schema(spec, &response["content"]["application/json"]["schema"])
+                expected_schema(
+                    spec,
+                    operation,
+                    &response["content"]["application/json"]["schema"],
+                )
             })
         })
 }
@@ -214,43 +239,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_bundled_bulk_schema_has_an_outcome_adapter() {
+    fn every_bundled_batch_operation_has_an_outcome_adapter() {
         let spec = specification();
-        let mut adapted = 0;
-        for (name, schema) in spec["components"]["schemas"].as_object().unwrap() {
-            let reference = json!({"$ref": format!("#/components/schemas/{name}")});
-            if let Some(ExpectedResponse::Bulk(kind)) = expected_schema(spec, &reference) {
-                assert!(
-                    kind != BulkResultKind::Unknown,
-                    "Add an outcome adapter before exposing bulk schema {name}"
-                );
-                assert!(schema.pointer("/properties/data/items").is_some());
-                adapted += 1;
+        let mut batches = Vec::new();
+        for (path, item) in spec["paths"].as_object().unwrap() {
+            for (method, operation) in item.as_object().unwrap() {
+                let Some(id) = operation["operationId"].as_str() else {
+                    continue;
+                };
+                if !id.ends_with("Bulk") && !path.contains("/bulk-") {
+                    continue;
+                }
+                let concrete = path
+                    .replace("{resourceId}", "rc_1")
+                    .replace("{branchId}", "prb_1");
+                match expected_response(&method.to_uppercase(), &concrete) {
+                    Some(ExpectedResponse::Bulk(kind)) => assert!(
+                        kind != BulkResultKind::Unknown,
+                        "The success schema of {id} changed; adapt its outcome validation"
+                    ),
+                    other => panic!("Add {id} to BULK_OPERATIONS before exposing it: {other:?}"),
+                }
+                batches.push(id);
             }
         }
-        assert_eq!(2, adapted);
-        for (method, path, kind) in [
-            (
-                "POST",
-                "/v2/resources/rc_1/keys/bulk-create",
-                BulkResultKind::KeyCreation,
-            ),
-            (
-                "POST",
-                "/v2/branches/prb_1/segments/bulk-update",
-                BulkResultKind::SegmentMutation,
-            ),
-            (
-                "POST",
-                "/v2/branches/prb_1/segments/bulk-transition",
-                BulkResultKind::SegmentMutation,
-            ),
-        ] {
-            assert_eq!(
-                Some(ExpectedResponse::Bulk(kind)),
-                expected_response(method, path)
-            );
-        }
+        batches.sort_unstable();
+        let mut mapped: Vec<_> = BULK_OPERATIONS.iter().map(|(id, _, _)| *id).collect();
+        mapped.sort_unstable();
+        assert_eq!(mapped, batches);
+        assert_eq!(
+            Some(ExpectedResponse::Bulk(BulkResultKind::KeyCreation)),
+            expected_response("POST", "/v2/resources/rc_1/keys/bulk-create")
+        );
+        assert_eq!(
+            Some(ExpectedResponse::Bulk(BulkResultKind::SegmentMutation)),
+            expected_response("POST", "/v2/branches/prb_1/segments/bulk-transition")
+        );
+    }
+
+    #[test]
+    fn list_shape_alone_does_not_make_an_operation_a_batch() {
+        let spec = specification();
+        let list = json!({"$ref":"#/components/schemas/SegmentList"});
+        assert_eq!(
+            None,
+            expected_schema(spec, &json!({"operationId":"listSomethingUnpaged"}), &list)
+        );
+        assert_eq!(
+            Some(ExpectedResponse::Bulk(BulkResultKind::Unknown)),
+            expected_schema(
+                spec,
+                &json!({"operationId":"createKeysBulk"}),
+                &json!({"$ref":"#/components/schemas/SegmentList"})
+            )
+        );
         assert_eq!(None, expected_response("GET", "/v2/branches/prb_1/segments"));
     }
 

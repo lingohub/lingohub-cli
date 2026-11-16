@@ -7831,6 +7831,170 @@ fn mcp_stdio_retains_partial_translation_results_and_marks_them_incomplete() {
 }
 
 #[test]
+fn mcp_stdio_sends_array_query_parameters_as_one_comma_separated_value() {
+    for (operation, path, target) in [
+        (
+            "getSegment",
+            json!({"segmentId":"seg_id"}),
+            "GET /v2/segments/seg_id?",
+        ),
+        (
+            "listSegments",
+            json!({"branchId":"prb_id"}),
+            "GET /v2/branches/prb_id/segments?",
+        ),
+    ] {
+        let stub = Stub::new(vec![response("200 OK", json!({"object_type":"SEGMENT"}), "")]);
+        let mut mcp = McpProcess::new(&stub.origin, &["--operation", operation]);
+        let catalog = mcp.call("tools/list", json!({}));
+        let tool = &catalog["result"]["tools"][0];
+        assert_eq!(
+            tool["inputSchema"]["properties"]["query"]["properties"]["language_codes"]["type"],
+            "array"
+        );
+        let name = tool["name"].as_str().unwrap();
+        let result = mcp.call(
+            "tools/call",
+            json!({"name":name,"arguments":{"path":path,"query":{"language_codes":["de","fr-CA"]}}}),
+        );
+        assert_eq!(result["result"]["isError"], false, "{result}");
+        let requests = stub.finish();
+        assert_eq!(requests.len(), 1);
+        let line = requests[0].lines().next().unwrap().replace("%2C", ",");
+        assert!(line.starts_with(target), "{line}");
+        assert!(line.contains("language_codes=de,fr-CA "), "{line}");
+    }
+}
+
+#[test]
+fn mcp_stdio_keeps_json_query_content_encoded_and_refuses_commas_inside_list_items() {
+    let stub = Stub::new(vec![response(
+        "200 OK",
+        json!({"object_type":"LIST","data":[],"has_more":false}),
+        "",
+    )]);
+    let mut mcp = McpProcess::new(&stub.origin, &["--operation", "listSegments"]);
+    let catalog = mcp.call("tools/list", json!({}));
+    let name = catalog["result"]["tools"][0]["name"].as_str().unwrap();
+    let refused = mcp.call(
+        "tools/call",
+        json!({"name":name,"arguments":{"path":{"branchId":"prb_id"},"query":{"language_codes":["de,fr"]}}}),
+    );
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(
+        refused["result"]["structuredContent"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("query.language_codes must list plain values without commas"),
+        "{refused}"
+    );
+    let filter = json!({"where":{"_and":[{"segment[label_ids]":{"_in":["lab_1","lab_2"]}}]}});
+    let result = mcp.call(
+        "tools/call",
+        json!({"name":name,"arguments":{"path":{"branchId":"prb_id"},"query":{"filter":filter,"limit":2}}}),
+    );
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    let requests = stub.finish();
+    assert_eq!(requests.len(), 1, "the refused call must not reach the API");
+    let line = requests[0].lines().next().unwrap();
+    let query = line.split_once('?').unwrap().1.split(' ').next().unwrap();
+    assert!(query.split('&').any(|pair| pair == "limit=2"), "{line}");
+    let encoded = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("filter="))
+        .unwrap();
+    // Decode the percent-encoding by hand: the test crate has no URL dependency.
+    let mut bytes = Vec::new();
+    let mut rest = encoded.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            let hex = std::str::from_utf8(&tail[..2]).unwrap();
+            bytes.push(u8::from_str_radix(hex, 16).unwrap());
+            rest = &tail[2..];
+        } else {
+            bytes.push(if byte == b'+' { b' ' } else { byte });
+            rest = tail;
+        }
+    }
+    let sent = &String::from_utf8(bytes).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(sent).unwrap(), filter);
+}
+
+#[test]
+fn mcp_stdio_reports_batch_outcomes_and_keeps_the_body_of_a_malformed_one() {
+    let keys = json!({"items":[{"key":"a"},{"key":"b"}]});
+    let segments = json!({"items":[{"segment_id":"seg_1"},{"segment_id":"seg_2"}]});
+    let key = |id: &str| json!({"object_type":"KEY","id":id});
+    let segment = |id: &str| json!({"object_type":"SEGMENT","id":id});
+    for (operation, path, input, status, data, malformed) in [
+        (
+            "createKeysBulk",
+            json!({"resourceId":"rc_id"}),
+            keys.clone(),
+            "201 Created",
+            vec![key("key_1"), key("key_2")],
+            false,
+        ),
+        (
+            "createKeysBulk",
+            json!({"resourceId":"rc_id"}),
+            keys.clone(),
+            "201 Created",
+            vec![key("key_1")],
+            true,
+        ),
+        (
+            "updateSegmentsBulk",
+            json!({"branchId":"prb_id"}),
+            segments.clone(),
+            "200 OK",
+            vec![segment("seg_1"), segment("seg_2")],
+            false,
+        ),
+        (
+            "updateSegmentsBulk",
+            json!({"branchId":"prb_id"}),
+            segments.clone(),
+            "200 OK",
+            vec![segment("seg_2"), segment("seg_1")],
+            true,
+        ),
+        (
+            "transitionSegmentsBulk",
+            json!({"branchId":"prb_id"}),
+            segments.clone(),
+            "200 OK",
+            vec![segment("seg_1"), key("seg_2")],
+            true,
+        ),
+    ] {
+        let body = json!({"object_type":"LIST","data":data});
+        let stub = Stub::new(vec![response(status, body.clone(), "")]);
+        let mut mcp = McpProcess::new(&stub.origin, &["--operation", operation]);
+        let catalog = mcp.call("tools/list", json!({}));
+        let name = catalog["result"]["tools"][0]["name"].as_str().unwrap();
+        let result = mcp.call("tools/call", json!({"name":name,"arguments":{"path":path,"body":input,"headers":{"Idempotency-Key":"batch-1"}}}));
+        let content = &result["result"]["structuredContent"];
+        assert_eq!(result["result"]["isError"], malformed, "{operation}: {result}");
+        assert_eq!(content["body"], body, "{operation}");
+        if malformed {
+            assert!(
+                content["outcome_error"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Malformed bulk result"),
+                "{operation}: {result}"
+            );
+        } else {
+            assert!(content.get("outcome_error").is_none(), "{operation}: {result}");
+        }
+        let requests = stub.finish();
+        assert_eq!(requests.len(), 1, "{operation} must not be retried");
+        assert!(requests[0].to_lowercase().contains("idempotency-key: batch-1"));
+    }
+}
+
+#[test]
 fn mcp_stdio_pages_the_selected_catalog_and_rejects_unknown_argument_groups() {
     let mut mcp = McpProcess::new("http://127.0.0.1:1", &["--all"]);
     let mut names = std::collections::BTreeSet::new();
