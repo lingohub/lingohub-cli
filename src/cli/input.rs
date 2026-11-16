@@ -81,7 +81,7 @@ pub fn request_body(file: Option<&str>, fields: &[(String, String)]) -> Result<O
 /// Prompt only for current top-level fields. Files preserve nested values and explicit nulls.
 pub fn interactive_body(resource: &str, create: bool) -> Result<Value, Error> {
     let fields: &[&str] = match (resource, create) {
-        ("stacks", true) => &["name", "color", "type"],
+        ("stacks", true) => &["name", "source_language_code"],
         ("stacks", false) => &["name", "color"],
         ("projects", true) => &["name", "type", "source_language_code", "target_language_codes"],
         ("projects", false) => &["name", "color", "website", "ai_context"],

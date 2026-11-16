@@ -218,6 +218,32 @@ fn assert_download_metadata_error(out: &Output, expected: &str) {
     );
 }
 
+/// The bundled OpenAPI contract, as the binary embeds it.
+fn bundled_contract() -> Value {
+    serde_json::from_str(include_str!("../contract/v2.json")).unwrap()
+}
+
+/// Follow `$ref` chains so shared headers, responses and schemas read like inline ones.
+fn deref<'a>(spec: &'a Value, mut value: &'a Value) -> &'a Value {
+    while let Some(reference) = value.get("$ref").and_then(Value::as_str) {
+        value = spec
+            .pointer(reference.strip_prefix('#').expect("local reference"))
+            .unwrap_or_else(|| panic!("unresolved reference {reference}"));
+    }
+    value
+}
+
+/// Find a bundled operation by its ID.
+fn bundled_operation<'a>(spec: &'a Value, id: &str) -> &'a Value {
+    spec["paths"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|item| item.as_object().unwrap().values())
+        .find(|operation| operation["operationId"] == id)
+        .unwrap_or_else(|| panic!("operation {id} is not bundled"))
+}
+
 fn header_values<'a>(raw: &'a str, name: &str) -> Vec<&'a str> {
     raw.split("\r\n\r\n")
         .next()
@@ -451,7 +477,7 @@ fn patch_preserves_null_omission_and_conditional_headers() {
 fn operation_lookup_uses_real_path_and_query_encoding() {
     let stub = Stub::new(vec![response(
         "200 OK",
-        json!({"variants":[{"plural_form":"ONE","content":"One"}]}),
+        json!({"object_type":"PROJECT_LANGUAGE","language_code":"de-AT"}),
         "",
     )]);
     let out = command(
@@ -460,9 +486,9 @@ fn operation_lookup_uses_real_path_and_query_encoding() {
             "--json",
             "api",
             "call",
-            "getSegmentText",
+            "getProjectLanguage",
             "--path",
-            "segmentId=seg_abcd",
+            "branchId=prb_abcd",
             "--path",
             "languageCode=de-AT",
             "--query",
@@ -471,7 +497,7 @@ fn operation_lookup_uses_real_path_and_query_encoding() {
         None,
     );
     success(&out);
-    assert!(stub.finish()[0].starts_with("GET /v2/segments/seg_abcd/texts/de-AT?custom=a%26b "));
+    assert!(stub.finish()[0].starts_with("GET /v2/branches/prb_abcd/languages/de-AT?custom=a%26b "));
 }
 #[test]
 fn structured_errors_keep_codes_pointers_request_id_and_retry_after() {
@@ -580,12 +606,13 @@ fn inventory_exposes_all_bundled_operations_and_content_types() {
         .collect();
     assert_eq!(actual, expected);
     assert_eq!(operations.as_array().unwrap().len(), actual.len());
+    assert_eq!(actual.len(), 247);
     for operation in [
         "getKey",
         "createKey",
-        "updateText",
-        "transitionText",
-        "renameKey",
+        "updateKey",
+        "updateSegment",
+        "transitionSegment",
         "deleteKey",
     ] {
         assert!(actual.contains(operation));
@@ -595,7 +622,7 @@ fn inventory_exposes_all_bundled_operations_and_content_types() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|op| op["operation_id"] == "getText")
+            .any(|op| op["operation_id"] == "getSegment")
     );
 }
 
@@ -809,7 +836,7 @@ fn key_operations_preserve_public_paths_conditions_and_key_json() {
             "\"key-version\"",
             "api",
             "call",
-            "renameKey",
+            "updateKey",
             "--path",
             &path_arg,
             "--file",
@@ -837,7 +864,7 @@ fn key_operations_preserve_public_paths_conditions_and_key_json() {
     assert!(delete.stdout.is_empty());
     let requests = stub.finish();
     assert!(requests[0].starts_with(&format!("GET /v2/keys/{id} ")));
-    assert!(requests[1].starts_with(&format!("POST /v2/keys/{id}/rename ")));
+    assert!(requests[1].starts_with(&format!("PATCH /v2/keys/{id} ")));
     assert!(requests[2].starts_with(&format!("DELETE /v2/keys/{id} ")));
     assert!(requests[1].to_lowercase().contains("if-match: \"key-version\""));
     assert!(
@@ -851,20 +878,29 @@ fn key_operations_preserve_public_paths_conditions_and_key_json() {
 
 #[test]
 fn text_operation_preserves_structured_variants_clears_conditions_and_field_errors() {
-    let id = "txt_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let path_arg = format!("textId={id}");
-    let context = "ress_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let body = json!({"key_id": context, "is_minor_update": null, "variants": [
+    let id = "seg_0197c8f2-5a6b-7cde-8f12-3456789abcde";
+    let path_arg = format!("segmentId={id}");
+    let project = "pr_0197c8f2-5a6b-7cde-8f12-3456789abcde";
+    let project_arg = format!("project_id={project}");
+    let body = json!({"texts": {"de": {"is_minor_update": null, "variants": [
         {"device":"OTHER", "plural_form":"ONE", "content":"One \"item\" {name}"},
         {"device":"PHONE", "plural_form":"OTHER", "content":"Many\nitems"}
-    ]});
-    let clear = json!({"key_id": context, "variants": []});
+    ]}}});
+    let clear = json!({"texts": {"de": {"variants": []}}});
+    let segment = |variants: Value| {
+        json!({"object_type":"SEGMENT","id":id,"is_plural":true,"texts":{"de":{
+            "is_source":false,"status":"TRANSLATED","stage":"NEEDS_REVIEW","variants":variants}}})
+    };
     let problem = json!({"status":422,"code":"validation_failed","errors":[
-        {"pointer":"#/variants/0/content","code":"type","detail":"must not be null"}
+        {"pointer":"#/texts/de/variants/0/content","code":"type","detail":"must not be null"}
     ]});
     let stub = Stub::new(vec![
-        response("200 OK", body.clone(), "ETag: \"new-text\"\r\n"),
-        response("200 OK", clear.clone(), ""),
+        response(
+            "200 OK",
+            segment(body["texts"]["de"]["variants"].clone()),
+            "ETag: \"new-segment\"\r\n",
+        ),
+        response("200 OK", segment(json!([])), ""),
         response("422 Unprocessable Entity", problem.clone(), ""),
     ]);
     let written = command(
@@ -873,26 +909,31 @@ fn text_operation_preserves_structured_variants_clears_conditions_and_field_erro
             "--json",
             "--include-headers",
             "--if-match",
-            "\"old-text\"",
+            "\"old-segment\"",
             "api",
             "call",
-            "updateText",
+            "updateSegment",
             "--path",
             &path_arg,
+            "--query",
+            &project_arg,
             "--file",
             "-",
         ],
         Some(&body.to_string()),
     );
-    assert_eq!(success(&written), body);
-    assert!(String::from_utf8_lossy(&written.stderr).contains("etag: \"new-text\""));
+    assert_eq!(
+        success(&written),
+        segment(body["texts"]["de"]["variants"].clone())
+    );
+    assert!(String::from_utf8_lossy(&written.stderr).contains("etag: \"new-segment\""));
     let cleared = command(
         &stub.origin,
         &[
             "--json",
             "api",
             "call",
-            "updateText",
+            "updateSegment",
             "--path",
             &path_arg,
             "--file",
@@ -900,29 +941,31 @@ fn text_operation_preserves_structured_variants_clears_conditions_and_field_erro
         ],
         Some(&clear.to_string()),
     );
-    assert_eq!(success(&cleared), clear);
+    assert_eq!(success(&cleared), segment(json!([])));
     let rejected = command(
         &stub.origin,
         &[
             "--json",
             "api",
             "call",
-            "updateText",
+            "updateSegment",
             "--path",
             &path_arg,
             "--file",
             "-",
         ],
-        Some("{\"variants\":[{\"content\":null}]}"),
+        Some("{\"texts\":{\"de\":{\"variants\":[{\"content\":null}]}}}"),
     );
     assert_eq!(rejected.status.code(), Some(1));
     let error: Value = serde_json::from_slice(&rejected.stderr).unwrap();
     assert_eq!(error["problem"], problem);
     let requests = stub.finish();
-    for request in &requests {
-        assert!(request.starts_with(&format!("PATCH /v2/texts/{id} ")));
+    assert!(requests[0].starts_with(&format!("PATCH /v2/segments/{id}?project_id={project} ")));
+    for request in &requests[1..] {
+        assert!(request.starts_with(&format!("PATCH /v2/segments/{id} ")));
     }
-    assert!(requests[0].to_lowercase().contains("if-match: \"old-text\""));
+    assert!(requests[0].to_lowercase().contains("if-match: \"old-segment\""));
+    assert!(!requests[1].to_lowercase().contains("if-match"));
     let actual: Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(actual, body);
     let actual_clear: Value = serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -931,27 +974,22 @@ fn text_operation_preserves_structured_variants_clears_conditions_and_field_erro
 
 #[test]
 fn named_text_transition_preserves_actions_conditions_replay_and_field_errors() {
-    let id = "txt_019b76da-c243-7000-8000-000000000701";
-    let path_arg = format!("textId={id}");
+    let id = "seg_019b76da-c243-7000-8000-000000000701";
+    let path_arg = format!("segmentId={id}");
     let actions = [
         ("APPROVE", "APPROVED"),
         ("REOPEN", "DRAFT"),
         ("MARK_TRANSLATED", "TRANSLATED"),
         ("REJECT", "REJECTED"),
     ];
+    let segment = |status: &str| json!({"object_type":"SEGMENT","id":id,"texts":{"de":{"is_source":false,"status":status,"variants":[]}}});
     let mut responses: Vec<String> = actions
         .iter()
-        .map(|(_, status)| {
-            response(
-                "200 OK",
-                json!({"id":id,"status":status,"variants":[]}),
-                "ETag: \"current\"\r\n",
-            )
-        })
+        .map(|(_, status)| response("200 OK", segment(status), "ETag: \"current\"\r\n"))
         .collect();
     responses.push(response(
         "200 OK",
-        json!({"id":id,"status":"APPROVED","variants":[]}),
+        segment("APPROVED"),
         "ETag: \"replayed\"\r\nIdempotent-Replayed: true\r\n",
     ));
     let invalid = json!({"status":422,"code":"validation_failed","errors":[{"pointer":"#/action","code":"not_supported"}]});
@@ -967,7 +1005,7 @@ fn named_text_transition_preserves_actions_conditions_replay_and_field_errors() 
                 "--include-headers",
                 "api",
                 "call",
-                "transitionText",
+                "transitionSegment",
                 "--path",
                 &path_arg,
                 "--if-match",
@@ -977,9 +1015,9 @@ fn named_text_transition_preserves_actions_conditions_replay_and_field_errors() 
                 "--file",
                 "-",
             ],
-            Some(&json!({"action":action}).to_string()),
+            Some(&json!({"language_code":"de","action":action}).to_string()),
         );
-        assert_eq!(success(&out), json!({"id":id,"status":status,"variants":[]}));
+        assert_eq!(success(&out), segment(status));
         assert!(String::from_utf8_lossy(&out.stderr).contains("etag: \"current\""));
     }
     let replay = command(
@@ -989,7 +1027,7 @@ fn named_text_transition_preserves_actions_conditions_replay_and_field_errors() 
             "--include-headers",
             "api",
             "call",
-            "transitionText",
+            "transitionSegment",
             "--path",
             &path_arg,
             "--if-match",
@@ -999,9 +1037,9 @@ fn named_text_transition_preserves_actions_conditions_replay_and_field_errors() 
             "--file",
             "-",
         ],
-        Some(r#"{"action":"APPROVE"}"#),
+        Some(r#"{"language_code":"de","action":"APPROVE"}"#),
     );
-    assert_eq!(success(&replay)["status"], "APPROVED");
+    assert_eq!(success(&replay)["texts"]["de"]["status"], "APPROVED");
     let headers = String::from_utf8_lossy(&replay.stderr);
     assert!(headers.contains("idempotent-replayed: true"));
     assert!(headers.contains("etag: \"replayed\""));
@@ -1012,7 +1050,7 @@ fn named_text_transition_preserves_actions_conditions_replay_and_field_errors() 
                 "--json",
                 "api",
                 "call",
-                "transitionText",
+                "transitionSegment",
                 "--path",
                 &path_arg,
                 "--if-match",
@@ -1020,7 +1058,7 @@ fn named_text_transition_preserves_actions_conditions_replay_and_field_errors() 
                 "--file",
                 "-",
             ],
-            Some(&json!({"action":action}).to_string()),
+            Some(&json!({"language_code":"de","action":action}).to_string()),
         );
         assert_eq!(out.status.code(), Some(1));
         assert!(out.stdout.is_empty());
@@ -1032,7 +1070,7 @@ fn named_text_transition_preserves_actions_conditions_replay_and_field_errors() 
     let requests = stub.finish();
     assert_eq!(requests.len(), 7);
     for (i, request) in requests.iter().enumerate() {
-        assert!(request.starts_with(&format!("POST /v2/texts/{id}/transition HTTP/1.1")));
+        assert!(request.starts_with(&format!("POST /v2/segments/{id}/transition HTTP/1.1")));
         assert!(request.to_lowercase().contains("content-type: application/json"));
         assert!(request.to_lowercase().contains("if-match: \"before\""));
         let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -1045,7 +1083,7 @@ fn named_text_transition_preserves_actions_conditions_replay_and_field_errors() 
             "MARK_TRANSLATED",
             "REOPEN",
         ][i];
-        assert_eq!(body, json!({"action":expected}));
+        assert_eq!(body, json!({"language_code":"de","action":expected}));
         if i < 5 {
             assert!(
                 request
@@ -1191,33 +1229,43 @@ fn named_key_creation_preserves_structured_body_and_created_location() {
     assert_eq!(submitted, body);
 }
 
-fn bulk_input(result: &Value) -> Value {
-    let items = result.get("data").and_then(Value::as_array).filter(|data| !data.is_empty())
-        .map(|data| data.iter().enumerate().map(|(index, item)| json!({"reference": item.get("reference").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| format!("item-{index}")), "key":{"key":format!("key_{index}"),"is_plural":false,"source_variants":[]}})).collect::<Vec<_>>())
-        .unwrap_or_else(|| vec![json!({"reference":"item-0","key":{"key":"key_0","is_plural":false,"source_variants":[]}})]);
-    json!({"items":items})
+fn key_batch_input(count: usize) -> Value {
+    json!({"items": (0..count)
+        .map(|index| json!({"key":format!("key_{index}"),"is_plural":false,"source_variants":[{"content":format!("Text {index}")}]}))
+        .collect::<Vec<_>>()})
 }
 
-fn bulk_result(outcomes: &[&str]) -> Value {
-    json!({"object_type":"BULK_RESULT","data":outcomes.iter().enumerate().map(|(index, outcome)| {
-        let status = match *outcome { "SUCCEEDED" => json!(201), "FAILED" => json!(422), "UNKNOWN" => json!(500), _ => Value::Null };
-        json!({"index":index,"reference":format!("item-{index}"),"outcome":outcome, "status":status,
-            "data":if *outcome == "SUCCEEDED" { json!({"object_type":"KEY","id":"ress_public"}) } else { Value::Null },
-            "location":if *outcome == "SUCCEEDED" { json!("/v2/keys/ress_public") } else { Value::Null },
-            "etag":if *outcome == "SUCCEEDED" { json!("\"version\"") } else { Value::Null },
-            "error":if matches!(*outcome, "FAILED" | "UNKNOWN") { json!({"status":status,"code":"example_problem"}) } else { Value::Null }})
-    }).collect::<Vec<_>>()})
+fn key_batch_result(count: usize) -> Value {
+    json!({"object_type":"LIST","data": (0..count)
+        .map(|index| json!({"object_type":"KEY","id":format!("ress_{index}"),"key":format!("key_{index}"),"segment_id":format!("seg_{index}")}))
+        .collect::<Vec<_>>()})
 }
+
+const KEY_BATCH: [&str; 8] = [
+    "--json",
+    "api",
+    "call",
+    "createKeysBulk",
+    "--path",
+    "resourceId=rc_example",
+    "--file",
+    "-",
+];
 
 #[test]
 fn bulk_success_preserves_ordered_results_and_sends_one_named_request() {
-    let body = bulk_result(&["SUCCEEDED", "SUCCEEDED"]);
-    let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
-    let input = bulk_input(&body).to_string();
+    let body = key_batch_result(2);
+    let stub = Stub::new(vec![response(
+        "201 Created",
+        body.clone(),
+        "Idempotent-Replayed: true\r\n",
+    )]);
+    let input = key_batch_input(2).to_string();
     let out = command(
         &stub.origin,
         &[
             "--json",
+            "--include-headers",
             "api",
             "call",
             "createKeysBulk",
@@ -1231,6 +1279,7 @@ fn bulk_success_preserves_ordered_results_and_sends_one_named_request() {
         Some(&input),
     );
     assert_eq!(success(&out), body);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("idempotent-replayed: true"));
     let requests = stub.finish();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].starts_with("POST /v2/resources/rc_example/keys/bulk-create "));
@@ -1242,159 +1291,28 @@ fn bulk_success_preserves_ordered_results_and_sends_one_named_request() {
 }
 
 #[test]
-fn bulk_partial_failure_preserves_full_stdout_and_reports_structured_summary() {
-    let mut body = bulk_result(&["SUCCEEDED", "FAILED", "SUCCEEDED"]);
-    body["data"][0]["etag"] = json!("\"created-version\"");
-    body["data"][0]["location"] = json!("/v2/keys/ress_public");
-    body["data"][1]["status"] = json!(422);
-    body["data"][1]["error"] = json!({"status":422,"code":"validation_failed","errors":[{"pointer":"#/items/1/key/key","code":"not_supported","detail":"Invalid key"}],"future_field":{"keep":true}});
-    let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "request",
-            "POST",
-            "/v2/resources/rc_example/keys/bulk-create",
-            "--file",
-            "-",
-        ],
-        Some(&bulk_input(&body).to_string()),
-    );
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-    let summary: Value = serde_json::from_slice(&out.stderr).unwrap();
-    assert_eq!(summary["error"], "bulk_incomplete");
-    assert!(
-        summary["detail"]
-            .as_str()
-            .unwrap()
-            .contains("Successful items are already committed")
-    );
-    assert_eq!(summary["succeeded"], 2);
-    assert_eq!(summary["failed"], 1);
-    assert_eq!(summary["unknown"], 0);
-    assert_eq!(stub.finish().len(), 1);
-}
-
-#[test]
-fn bulk_uncertain_future_and_unprocessed_outcomes_fail_without_retrying() {
-    for outcome in ["UNKNOWN", "NOT_PROCESSED", "FUTURE_OUTCOME"] {
-        let body = bulk_result(&["SUCCEEDED", outcome]);
-        let stub = Stub::new(vec![response(
-            "200 OK",
-            body.clone(),
-            "Idempotent-Replayed: true\r\n",
-        )]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "--include-headers",
-                "api",
-                "call",
-                "createKeysBulk",
-                "--path",
-                "resourceId=rc_example",
-                "--file",
-                "-",
-            ],
-            Some(&bulk_input(&body).to_string()),
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("idempotent-replayed: true"));
-        assert!(stderr.contains("bulk_incomplete"));
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn malformed_bulk_envelopes_fail_after_preserving_the_response() {
-    for body in [
-        json!({"object_type":"BULK_RESULT"}),
-        json!({"object_type":"BULK_RESULT","data":{}}),
-        bulk_result(&[]),
-        json!({"object_type":"BULK_RESULT","data":[{}]}),
-        json!({"object_type":"BULK_RESULT","data":[{"outcome":42}]}),
+fn bulk_rejection_preserves_the_item_problem_and_never_retries() {
+    for (status, problem, headers) in [
+        (
+            "422 Unprocessable Entity",
+            json!({"status":422,"code":"validation_failed","errors":[{"pointer":"#/items/1/key","code":"not_supported","detail":"Invalid key"}],"future_field":{"keep":true}}),
+            "",
+        ),
+        (
+            "409 Conflict",
+            json!({"status":409,"code":"idempotency_in_progress","request_id":"trace-bulk"}),
+            "Retry-After: 3\r\n",
+        ),
+        (
+            "500 Internal Server Error",
+            json!({"status":500,"code":"internal_error"}),
+            "",
+        ),
     ] {
-        let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "createKeysBulk",
-                "--path",
-                "resourceId=rc_example",
-                "--file",
-                "-",
-            ],
-            Some(&bulk_input(&body).to_string()),
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("Malformed BULK_RESULT"));
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn human_bulk_output_keeps_each_item_and_reports_failure_separately() {
-    let body = bulk_result(&["SUCCEEDED", "NOT_PROCESSED"]);
-    let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
-    let out = command(
-        &stub.origin,
-        &[
-            "api",
-            "call",
-            "createKeysBulk",
-            "--path",
-            "resourceId=rc_example",
-            "--file",
-            "-",
-        ],
-        Some(&bulk_input(&body).to_string()),
-    );
-    assert_eq!(out.status.code(), Some(1));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("reference: item-0"));
-    assert!(stdout.contains("reference: item-1"));
-    assert!(stdout.contains("outcome: NOT_PROCESSED"));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("1 succeeded, 0 failed, 0 unknown, 1 not processed")
-    );
-    assert_eq!(stub.finish().len(), 1);
-}
-
-#[test]
-fn known_bulk_calls_reject_missing_or_wrong_discriminator_and_empty_bodies() {
-    for named in [true, false] {
-        for body in [
-            json!({"data":[{"outcome":"FAILED"}]}),
-            json!({"object_type":"LIST","data":[{"outcome":"UNKNOWN"}]}),
-            Value::Null,
-        ] {
-            let wire = if body.is_null() {
-                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
-            } else {
-                response("200 OK", body.clone(), "")
-            };
-            let stub = Stub::new(vec![wire]);
-            let args = if named {
-                vec![
-                    "--json",
-                    "api",
-                    "call",
-                    "createKeysBulk",
-                    "--path",
-                    "resourceId=rc_example",
-                    "--file",
-                    "-",
-                ]
+        for named in [true, false] {
+            let stub = Stub::new(vec![response(status, problem.clone(), headers)]);
+            let args: Vec<&str> = if named {
+                KEY_BATCH.to_vec()
             } else {
                 vec![
                     "--json",
@@ -1406,157 +1324,178 @@ fn known_bulk_calls_reject_missing_or_wrong_discriminator_and_empty_bodies() {
                     "-",
                 ]
             };
-            let out = command(&stub.origin, &args, Some(&bulk_input(&body).to_string()));
+            let out = command(&stub.origin, &args, Some(&key_batch_input(3).to_string()));
             assert_eq!(out.status.code(), Some(1));
-            if body.is_null() {
-                assert!(out.stdout.is_empty());
-            } else {
-                assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-            }
-            assert!(String::from_utf8_lossy(&out.stderr).contains("BULK_RESULT"));
+            assert!(out.stdout.is_empty());
+            let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+            assert_eq!(error["problem"], problem);
+            assert_eq!(
+                error["retry_after"],
+                if headers.is_empty() {
+                    Value::Null
+                } else {
+                    json!("3")
+                }
+            );
             assert_eq!(stub.finish().len(), 1);
         }
     }
 }
 
 #[test]
-fn bulk_results_must_match_every_submitted_index_and_reference() {
-    let input = json!({"items":[{"reference":"item-0"},{"reference":"item-1"}]});
-    for variant in ["missing", "index", "reference"] {
-        let mut body = bulk_result(&["SUCCEEDED", "SUCCEEDED"]);
-        match variant {
-            "missing" => {
-                body["data"].as_array_mut().unwrap().pop();
-            }
-            "index" => body["data"][1]["index"] = json!(0),
-            _ => body["data"][1]["reference"] = json!("wrong"),
-        }
-        let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "createKeysBulk",
-                "--path",
-                "resourceId=rc_example",
-                "--file",
-                "-",
-            ],
-            Some(&input.to_string()),
-        );
+fn malformed_bulk_envelopes_fail_after_preserving_the_response() {
+    for body in [
+        json!({"object_type":"LIST"}),
+        json!({"object_type":"LIST","data":{}}),
+        key_batch_result(0),
+        json!({"object_type":"LIST","data":[{}]}),
+        json!({"object_type":"LIST","data":[{"object_type":"KEY"}]}),
+        json!({"object_type":"LIST","data":[{"object_type":"KEY","id":""}]}),
+        json!({"object_type":"LIST","data":[{"object_type":"KEY","id":42}]}),
+    ] {
+        let stub = Stub::new(vec![response("201 Created", body.clone(), "")]);
+        let out = command(&stub.origin, &KEY_BATCH, Some(&key_batch_input(1).to_string()));
         assert_eq!(out.status.code(), Some(1));
         assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("BULK_RESULT"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Malformed bulk result"));
         assert_eq!(stub.finish().len(), 1);
     }
 }
 
 #[test]
-fn bulk_success_requires_result_fields_and_their_success_types() {
-    for field in ["data", "error", "etag", "location", "status"] {
-        for missing in [true, false] {
-            let mut body = bulk_result(&["SUCCEEDED"]);
-            if missing {
-                body["data"][0].as_object_mut().unwrap().remove(field);
+fn human_bulk_output_keeps_each_created_item() {
+    let body = key_batch_result(2);
+    let stub = Stub::new(vec![response("201 Created", body.clone(), "")]);
+    let out = command(
+        &stub.origin,
+        &KEY_BATCH[1..],
+        Some(&key_batch_input(2).to_string()),
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("id: ress_0"));
+    assert!(stdout.contains("key: key_0"));
+    assert!(stdout.contains("id: ress_1"));
+    assert!(stdout.contains("key: key_1"));
+    assert!(out.stderr.is_empty());
+    assert_eq!(stub.finish().len(), 1);
+}
+
+#[test]
+fn known_bulk_calls_reject_missing_or_wrong_discriminator_and_empty_bodies() {
+    for named in [true, false] {
+        for body in [
+            json!({"data":[{"object_type":"KEY","id":"ress_0"}]}),
+            json!({"object_type":"BULK_RESULT","data":[{"object_type":"KEY","id":"ress_0"}]}),
+            Value::Null,
+        ] {
+            let wire = if body.is_null() {
+                "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
             } else {
-                body["data"][0][field] = json!(false);
-            }
-            let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
-            let out = command(
-                &stub.origin,
-                &[
+                response("201 Created", body.clone(), "")
+            };
+            let stub = Stub::new(vec![wire]);
+            let args: Vec<&str> = if named {
+                KEY_BATCH.to_vec()
+            } else {
+                vec![
                     "--json",
                     "api",
-                    "call",
-                    "createKeysBulk",
-                    "--path",
-                    "resourceId=rc_example",
+                    "request",
+                    "POST",
+                    "/v2/resources/rc_example/keys/bulk-create",
                     "--file",
                     "-",
-                ],
-                Some(&bulk_input(&body).to_string()),
-            );
+                ]
+            };
+            let out = command(&stub.origin, &args, Some(&key_batch_input(1).to_string()));
             assert_eq!(out.status.code(), Some(1));
-            assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-            assert!(String::from_utf8_lossy(&out.stderr).contains("Malformed BULK_RESULT"));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if body.is_null() {
+                assert!(out.stdout.is_empty());
+                assert!(stderr.contains("Expected a bulk LIST response, but the server returned no body"));
+            } else {
+                assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
+                assert!(stderr.contains("Malformed bulk result"));
+            }
             assert_eq!(stub.finish().len(), 1);
         }
     }
 }
 
 #[test]
-fn bulk_creation_success_requires_201_and_a_key_discriminator() {
-    for (status, object_type) in [
-        (200, "KEY"),
-        (202, "KEY"),
-        (204, "KEY"),
-        (201, "TEXT"),
-        (201, "SEGMENT"),
-        (201, "FUTURE"),
-    ] {
-        let mut body = bulk_result(&["SUCCEEDED"]);
-        body["data"][0]["status"] = json!(status);
-        body["data"][0]["data"]["object_type"] = json!(object_type);
-        let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
+fn bulk_results_must_list_one_resource_per_submitted_item() {
+    for (submitted, returned) in [(2, 1), (2, 3), (1, 2)] {
+        let body = key_batch_result(returned);
+        let stub = Stub::new(vec![response("201 Created", body.clone(), "")]);
         let out = command(
             &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "createKeysBulk",
-                "--path",
-                "resourceId=rc_example",
-                "--file",
-                "-",
-            ],
-            Some(&bulk_input(&body).to_string()),
+            &KEY_BATCH,
+            Some(&key_batch_input(submitted).to_string()),
         );
         assert_eq!(out.status.code(), Some(1));
         assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("Malformed BULK_RESULT"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("Malformed bulk result"));
+        assert!(stderr.contains("The batch may be committed"));
         assert_eq!(stub.finish().len(), 1);
     }
 }
 
-fn text_batch_input(workflow: bool) -> Value {
-    json!({"items":[if workflow {
-        json!({"reference":"item-0","text_id":"txt_example","key_id":"ress_example","action":"APPROVE","if_match":"\"current\""})
-    } else {
-        json!({"reference":"item-0","text_id":"txt_example","if_match":"\"current\"","update":{"key_id":"ress_example","variants":[{"device":"PHONE","plural_form":"OTHER","content":"Updated"}],"is_minor_update":true}})
-    }]})
+#[test]
+fn bulk_creation_success_requires_a_key_discriminator() {
+    for object_type in [json!("TEXT"), json!("SEGMENT"), json!("FUTURE"), Value::Null] {
+        let mut body = key_batch_result(2);
+        body["data"][1]["object_type"] = object_type;
+        let stub = Stub::new(vec![response("201 Created", body.clone(), "")]);
+        let out = command(&stub.origin, &KEY_BATCH, Some(&key_batch_input(2).to_string()));
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Malformed bulk result"));
+        assert_eq!(stub.finish().len(), 1);
+    }
 }
 
-fn text_batch_result(outcomes: &[&str]) -> Value {
-    let mut body = bulk_result(outcomes);
-    for item in body["data"].as_array_mut().unwrap() {
-        if item["outcome"] == "SUCCEEDED" {
-            item["status"] = json!(200);
-            item["data"] = json!({"id":"txt_example","object_type":"TEXT","status":"APPROVED","variants":[]});
-            item["location"] = json!("/v2/texts/txt_example");
-        }
+const SEGMENT_BATCH_IDS: [&str; 2] = [
+    "seg_0197c8f2-5a6b-7cde-8f12-3456789abcde",
+    "seg_0197c8f2-5a6b-7cde-8f12-3456789abcdf",
+];
+
+fn segment_batch_input(workflow: bool) -> Value {
+    json!({"items": SEGMENT_BATCH_IDS.iter().map(|id| if workflow {
+        json!({"segment_id":id,"language_code":"de","action":"APPROVE"})
+    } else {
+        json!({"segment_id":id,"is_plural":false,"texts":{"de":{"variants":[{"device":"PHONE","plural_form":"OTHER","content":"Updated"}],"is_minor_update":true}}})
+    }).collect::<Vec<_>>()})
+}
+
+fn segment_batch_result() -> Value {
+    json!({"object_type":"LIST","data": SEGMENT_BATCH_IDS.iter().map(|id| {
+        json!({"object_type":"SEGMENT","id":id,"is_plural":false,"texts":{"de":{"is_source":false,"status":"APPROVED","stage":"DONE","variants":[]}}})
+    }).collect::<Vec<_>>()})
+}
+
+fn segment_batch(workflow: bool) -> (&'static str, &'static str) {
+    if workflow {
+        (
+            "transitionSegmentsBulk",
+            "/v2/branches/prb_example/segments/bulk-transition",
+        )
+    } else {
+        (
+            "updateSegmentsBulk",
+            "/v2/branches/prb_example/segments/bulk-update",
+        )
     }
-    body
 }
 
 #[test]
-fn text_batches_preserve_named_and_raw_paths_bodies_and_item_conditions() {
+fn segment_batches_preserve_named_and_raw_paths_bodies_and_replay_key() {
     for workflow in [false, true] {
-        let operation = if workflow {
-            "transitionTextsBulk"
-        } else {
-            "updateTextsBulk"
-        };
-        let path = if workflow {
-            "/v2/branches/prb_example/texts/bulk-transition"
-        } else {
-            "/v2/branches/prb_example/texts/bulk-update"
-        };
+        let (operation, path) = segment_batch(workflow);
         for named in [false, true] {
-            let body = text_batch_result(&["SUCCEEDED"]);
-            let input = text_batch_input(workflow);
+            let body = segment_batch_result();
+            let input = segment_batch_input(workflow);
             let stub = Stub::new(vec![response(
                 "200 OK",
                 body.clone(),
@@ -1568,14 +1507,18 @@ fn text_batches_preserve_named_and_raw_paths_bodies_and_item_conditions() {
             } else {
                 args.extend(["request", "POST", path]);
             }
-            args.extend(["--idempotency-key", "text-batch", "--file", "-"]);
+            args.extend(["--idempotency-key", "segment-batch", "--file", "-"]);
             let out = command(&stub.origin, &args, Some(&input.to_string()));
             assert_eq!(success(&out), body);
             assert!(String::from_utf8_lossy(&out.stderr).contains("idempotent-replayed: true"));
             let requests = stub.finish();
             assert_eq!(requests.len(), 1);
             assert!(requests[0].starts_with(&format!("POST {path} ")));
-            assert!(requests[0].to_lowercase().contains("idempotency-key: text-batch"));
+            assert!(
+                requests[0]
+                    .to_lowercase()
+                    .contains("idempotency-key: segment-batch")
+            );
             assert!(!requests[0].to_lowercase().contains("\r\nif-match:"));
             assert_eq!(
                 serde_json::from_str::<Value>(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap(),
@@ -1586,12 +1529,19 @@ fn text_batches_preserve_named_and_raw_paths_bodies_and_item_conditions() {
 }
 
 #[test]
-fn text_batches_reject_wrong_success_status_and_resource_kind() {
-    for operation in ["updateTextsBulk", "transitionTextsBulk"] {
-        for (status, kind) in [(201, "TEXT"), (202, "TEXT"), (200, "KEY"), (200, "TRANSLATION")] {
-            let mut body = text_batch_result(&["SUCCEEDED"]);
-            body["data"][0]["status"] = json!(status);
-            body["data"][0]["data"]["object_type"] = json!(kind);
+fn segment_batches_reject_wrong_resource_kind_identity_and_order() {
+    for workflow in [false, true] {
+        let (operation, _) = segment_batch(workflow);
+        for variant in ["kind", "identity", "order", "missing"] {
+            let mut body = segment_batch_result();
+            match variant {
+                "kind" => body["data"][1]["object_type"] = json!("KEY"),
+                "identity" => body["data"][1]["id"] = json!("seg_0197c8f2-5a6b-7cde-8f12-000000000000"),
+                "order" => body["data"].as_array_mut().unwrap().reverse(),
+                _ => {
+                    body["data"].as_array_mut().unwrap().pop();
+                }
+            }
             let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
             let out = command(
                 &stub.origin,
@@ -1605,55 +1555,51 @@ fn text_batches_reject_wrong_success_status_and_resource_kind() {
                     "--file",
                     "-",
                 ],
-                Some(&text_batch_input(operation == "transitionTextsBulk").to_string()),
+                Some(&segment_batch_input(workflow).to_string()),
             );
             assert_eq!(out.status.code(), Some(1));
             assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-            assert!(String::from_utf8_lossy(&out.stderr).contains("Malformed BULK_RESULT"));
+            assert!(String::from_utf8_lossy(&out.stderr).contains("Malformed bulk result"));
             assert_eq!(stub.finish().len(), 1);
         }
     }
 }
 
 #[test]
-fn text_batch_partial_problems_remain_visible_without_retry() {
+fn segment_batch_problems_remain_visible_without_retry() {
     for workflow in [false, true] {
-        let operation = if workflow {
-            "transitionTextsBulk"
-        } else {
-            "updateTextsBulk"
-        };
-        let mut input = text_batch_input(workflow);
-        let mut second = input["items"][0].clone();
-        second["reference"] = json!("item-1");
-        second["text_id"] = json!("txt_second");
-        input["items"].as_array_mut().unwrap().push(second);
-        let mut body = text_batch_result(&["SUCCEEDED", "FAILED"]);
-        body["data"][1]["status"] = json!(412);
-        body["data"][1]["error"] =
-            json!({"status":412,"code":"precondition_failed","request_id":"trace-bulk"});
-        let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                operation,
-                "--path",
-                "branchId=prb_example",
-                "--file",
-                "-",
-            ],
-            Some(&input.to_string()),
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-        let summary: Value = serde_json::from_slice(&out.stderr).unwrap();
-        assert_eq!(summary["error"], "bulk_incomplete");
-        assert_eq!(summary["succeeded"], 1);
-        assert_eq!(summary["failed"], 1);
-        assert_eq!(stub.finish().len(), 1);
+        let (operation, _) = segment_batch(workflow);
+        for (status, problem) in [
+            (
+                "422 Unprocessable Entity",
+                json!({"status":422,"code":"validation_failed","errors":[{"pointer":"#/items/1/segment_id","code":"not_found"}],"request_id":"trace-bulk"}),
+            ),
+            (
+                "404 Not Found",
+                json!({"status":404,"code":"not_found","request_id":"trace-bulk"}),
+            ),
+        ] {
+            let stub = Stub::new(vec![response(status, problem.clone(), "")]);
+            let out = command(
+                &stub.origin,
+                &[
+                    "--json",
+                    "api",
+                    "call",
+                    operation,
+                    "--path",
+                    "branchId=prb_example",
+                    "--file",
+                    "-",
+                ],
+                Some(&segment_batch_input(workflow).to_string()),
+            );
+            assert_eq!(out.status.code(), Some(1));
+            assert!(out.stdout.is_empty());
+            let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+            assert_eq!(error["problem"], problem);
+            assert_eq!(stub.finish().len(), 1);
+        }
     }
 }
 
@@ -1674,15 +1620,11 @@ fn lina_discovery_preserves_named_paths_pages_and_nullable_configuration() {
                 "is_style_guide_enabled": true,
                 "is_translation_memory_enabled": true
               },
-              "context_selection_mode": "AUTO",
               "created_at": "2026-09-29T10:00:00.123Z",
               "description": null,
               "engine_mode": "CUSTOMER_MANAGED",
               "glossary_id": null,
               "id": "lina_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-              "is_archived": false,
-              "is_disabled": false,
-              "is_restricted": false,
               "is_tm_match_enabled": true,
               "language_engine_overrides": [],
               "linguistic_engine_id": "engine_0197c8f2-5a6b-7cde-8f12-3456789abcde",
@@ -1691,7 +1633,6 @@ fn lina_discovery_preserves_named_paths_pages_and_nullable_configuration() {
               "restricted_stack_ids": [
                 "stack_0197c8f2-5a6b-7cde-8f12-3456789abcde"
               ],
-              "reviewer_linguistic_engine_id": null,
               "style_guide_id": null,
               "updated_at": "2026-09-29T10:00:00.123Z"
             }),
@@ -2071,10 +2012,15 @@ fn webhook_request_inspection_preserves_serialized_body_and_nullable_preview() {
         "created_at":"2026-09-29T10:00:00Z","workspace_id":"space_0197c8f2-5a6b-7cde-8f12-3456789abcde",
         "data":{"message":"escaped \"text\"\nand newline"}})
     .to_string();
+    let contract = bundled_contract();
+    assert_eq!(
+        contract["components"]["schemas"]["WebhookRequestDetails"]["required"],
+        json!(["body", "headers", "url"])
+    );
     for body in [json!(envelope), Value::Null] {
-        let preview = json!({"object_type":"WEBHOOK_DELIVERY_REQUEST","webhook_delivery_id":delivery,
-            "url":"https://example.com/hooks","request_headers":{"content-type":"application/json",
-            "user-agent":"LingoHub-Webhooks/1","webhook-id":event},"request_body":body,
+        let preview = json!({"object_type":"WEBHOOK_DELIVERY","id":delivery,"event_id":event,"status":"SUCCEEDED",
+            "request":{"url":"https://example.com/hooks","headers":{"content-type":"application/json",
+            "user-agent":"LingoHub-Webhooks/1","webhook-id":event},"body":body},
             "created_at":"2026-09-29T10:00:00.000Z","updated_at":"2026-09-29T10:00:00.000Z"});
         let stub = Stub::new(vec![response("200 OK", preview.clone(), "ETag: \"preview\"\r\n")]);
         let out = command(
@@ -2084,7 +2030,7 @@ fn webhook_request_inspection_preserves_serialized_body_and_nullable_preview() {
                 "--include-headers",
                 "api",
                 "call",
-                "getWebhookDeliveryRequest",
+                "getWebhookDelivery",
                 "--path",
                 &format!("webhookDeliveryId={delivery}"),
             ],
@@ -2093,7 +2039,7 @@ fn webhook_request_inspection_preserves_serialized_body_and_nullable_preview() {
         assert_eq!(success(&out), preview);
         assert!(String::from_utf8_lossy(&out.stderr).contains("etag: \"preview\""));
         let requests = stub.finish();
-        assert!(requests[0].starts_with(&format!("GET /v2/webhook-deliveries/{delivery}/request ")));
+        assert!(requests[0].starts_with(&format!("GET /v2/webhook-deliveries/{delivery} ")));
         assert_eq!(requests[0].split_once("\r\n\r\n").unwrap().1, "");
     }
 }
@@ -2723,7 +2669,7 @@ fn waiting(origin: &str, operation: &str, parameter: &str, extras: &[&str]) -> O
 
 #[test]
 fn polling_follows_pending_states_and_prints_only_the_final_resource() {
-    let completed = json!({"object_type":"IMPORT","id":"rin_123","status":"SUCCEEDED","segments_created":2,"status_details":null});
+    let completed = json!({"object_type":"IMPORT","id":"rin_123","status":"SUCCEEDED","texts_created":2,"status_details":null});
     let api = Stub::new(vec![
         response(
             "200 OK",
@@ -2840,7 +2786,7 @@ fn polling_returns_nonzero_for_terminal_failures_and_preserves_partial_results()
         assert!(String::from_utf8_lossy(&out.stderr).contains(status));
         assert_eq!(api.finish().len(), 1);
     }
-    let branch = json!({"object_type":"BRANCH","id":"prb_123","status":"SUCCEEDED","initialization_status":"FAILED","initialization_error":"copy failed"});
+    let branch = json!({"object_type":"BRANCH","id":"prb_123","status":"SUCCEEDED","initialization_status":"FAILED","git_branch":null});
     let api = Stub::new(vec![response("200 OK", branch.clone(), "")]);
     let out = waiting(&api.origin, "getBranch", "branchId=prb_123", &[]);
     assert_eq!(out.status.code(), Some(1));
@@ -3311,7 +3257,7 @@ fn invitation_discovery_preserves_states_metadata_filters_and_cursors() {
         } else {
             None
         };
-        let invitation = json!({"object_type":"INVITATION","id":id,"workspace_role_id":"rol_0197c8f2-5a6b-7cde-8f12-3456789abcde","inviter_actor_id":"act_0197c8f2-5a6b-7cde-8f12-3456789abcde","invitee_user_id":null,"email":"invitee@example.test","invitee_name":"Älex 😀","message":null,"is_stack_assignment_configured":false,"status":state,"expires_at":"2026-10-01T10:00:00.123Z","accepted_at":accepted,"declined_at":declined,"created_at":"2026-09-29T10:00:00.123Z","updated_at":"2026-09-29T10:00:00.123Z"});
+        let invitation = json!({"object_type":"INVITATION","id":id,"workspace_role_id":"rol_0197c8f2-5a6b-7cde-8f12-3456789abcde","inviter_email":null,"email":"invitee@example.test","invitee_name":"Älex 😀","message":null,"is_stack_assignment_configured":false,"status":state,"expires_at":"2026-10-01T10:00:00.123Z","accepted_at":accepted,"declined_at":declined,"created_at":"2026-09-29T10:00:00.123Z","updated_at":"2026-09-29T10:00:00.123Z"});
         let stub = Stub::new(vec![response(
             "200 OK",
             invitation.clone(),
@@ -3786,7 +3732,7 @@ fn stack_member_set_retains_field_errors_and_never_retries_mutations() {
 #[test]
 fn secret_rotation_prints_original_material_only_on_stdout_with_condition_and_key() {
     let endpoint = "whe_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let body = json!({"object_type":"WEBHOOK_ENDPOINT_SECRET", "id":endpoint,
+    let body = json!({"object_type":"WEBHOOK_ENDPOINT", "id":endpoint, "status":"ENABLED",
         "secret":"whsec_explicit-once", "created_at":"2026-09-30T00:00:00.123Z", "updated_at":"2026-09-30T01:00:00.123Z"});
     let stub = Stub::new(vec![response(
         "200 OK",
@@ -3871,7 +3817,7 @@ fn git_discovery_preserves_configuration_binding_and_validators() {
             "projectId",
             "pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
             "projects",
-            json!({"object_type":"PROJECT_GIT_INTEGRATION","connection_status":"SUSPENDED","provider_origin":"https://git.example.com:8443","import_settings":{"sync_mode":"NONE","schedule":null},"export_settings":{"sync_mode":"ON_COMPLETION"},"resource_filters":[]}),
+            json!({"object_type":"PROJECT_GIT_INTEGRATION","connection_status":"SUSPENDED","provider_origin":"https://git.example.com:8443","sync":{"import_mode":"NONE","import_schedule":null,"export_mode":"ON_COMPLETION","export_schedule":null},"selection":{"is_branching":false,"path_filters":[],"branch_filters":[]}}),
         ),
         (
             "getProjectGitIntegration",
@@ -3885,7 +3831,7 @@ fn git_discovery_preserves_configuration_binding_and_validators() {
             "branchId",
             "prb_0197c8f2-5a6b-7cde-8f12-3456789abcde",
             "branches",
-            json!({"object_type":"BRANCH_GIT_INTEGRATION","git_branch":"remote/release","last_push_commit_sha":"commit","last_pulled_commit_sha":null,"is_protected":true}),
+            json!({"object_type":"BRANCH_GIT_INTEGRATION","git_branch":"remote/release","last_push_commit_sha":"commit","last_pull_commit_sha":null,"is_protected":true}),
         ),
     ] {
         let stub = Stub::new(vec![response("200 OK", body.clone(), "ETag: \"git-state\"\r\n")]);
@@ -4256,33 +4202,6 @@ fn backup_wait_preserves_terminal_metadata_without_rescheduling() {
         assert_eq!(requests.len(), 2);
         assert!(requests.iter().all(|r| r.starts_with("GET /v2/backups/bkp_123 ")));
     }
-}
-
-#[test]
-fn restore_discovery_preserves_public_references_languages_and_cursor_arguments() {
-    let body = json!({"object_type":"LIST","has_more":false,"next_cursor":null,"data":[{"object_type":"BACKUP_RESTORE","id":"bkr_123","branch_id":"prb_123","backup_id":"bkp_123","project_id":"pr_123","status":"QUEUED","language_codes":["en","de"],"created_at":"2026-09-30T00:00:00.000Z","updated_at":"2026-09-30T00:00:00.000Z"}]});
-    let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "listBackupRestores",
-            "--path",
-            "branchId=prb_123",
-            "--query",
-            "limit=1",
-            "--query",
-            "cursor=opaque",
-        ],
-        None,
-    );
-    assert_eq!(success(&out), body);
-    let requests = stub.finish();
-    assert!(requests[0].starts_with("GET /v2/branches/prb_123/backup-restores?"));
-    assert!(requests[0].contains("limit=1"));
-    assert!(requests[0].contains("cursor=opaque"));
 }
 
 #[test]
@@ -5216,13 +5135,7 @@ fn historical_json_numbers_round_trip_without_float_conversion() {
     let stub = Stub::new(vec![raw]);
     let out = command(
         &stub.origin,
-        &[
-            "--json",
-            "api",
-            "request",
-            "GET",
-            "/v2/audit-logs/audit_fixture/changes",
-        ],
+        &["--json", "api", "request", "GET", "/v2/audit-logs/audit_fixture"],
         None,
     );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -5238,56 +5151,28 @@ fn historical_json_numbers_round_trip_without_float_conversion() {
 }
 
 #[test]
-fn audit_changes_preserve_availability_nulls_omissions_and_historical_identity() {
+fn audit_changes_preserve_redaction_nulls_omissions_and_historical_identity() {
     let id = "audit_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let body = json!({"object_type":"AUDIT_LOG_CHANGES","id":id,"is_available":true,"omitted_datasets":0,"datasets":[{"entity_type":"WEBHOOK","is_available":true,"entity_id":"whe_0197c8f2-5a6b-7cde-8f12-3456789abcde","identity_availability":"AVAILABLE","omitted_entries":1,"entries":[{"name":"secret","is_changed":true,"value":{"availability":"REDACTED","value":null},"original":{"availability":"REDACTED","value":null}},{"name":"description","is_changed":null,"value":{"availability":"AVAILABLE","value":null},"original":{"availability":"UNAVAILABLE","value":null}}]}],"created_at":"2026-09-30T12:00:00.123Z","updated_at":"2026-09-30T12:00:00.123Z"});
-    let stub = Stub::new(vec![response("200 OK", body.clone(), "ETag: \"changes\"\r\n")]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "--include-headers",
-            "api",
-            "call",
-            "getAuditLogChanges",
-            "--path",
-            &format!("auditLogId={id}"),
-        ],
-        None,
-    );
-    assert_eq!(success(&out), body);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("etag: \"changes\""));
-    assert!(stub.finish()[0].starts_with(&format!("GET /v2/audit-logs/{id}/changes ")));
-}
-
-#[test]
-fn audit_changes_preserve_current_access_failures_without_retry() {
-    for (status, code) in [
-        ("401 Unauthorized", "disabled_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-    ] {
-        let body = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"audit-changes-request"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
+    let changes = json!({"omitted_datasets":0,"datasets":[{"entity_type":"WEBHOOK","entity_id":"whe_0197c8f2-5a6b-7cde-8f12-3456789abcde","omitted_entries":1,"entries":[{"name":"secret","is_changed":true,"is_redacted":true,"value":null,"previous_value":null},{"name":"description","is_changed":null,"is_redacted":false,"value":null,"previous_value":"Before"}]},{"entity_type":"UNKNOWN","entity_id":null,"omitted_entries":0,"entries":[]}]});
+    for changes in [changes, Value::Null] {
+        let body = json!({"object_type":"AUDIT_LOG","id":id,"event":"UPDATED","changes":changes,"created_at":"2026-09-30T12:00:00.123Z","updated_at":"2026-09-30T12:00:00.123Z"});
+        let stub = Stub::new(vec![response("200 OK", body.clone(), "ETag: \"changes\"\r\n")]);
         let out = command(
             &stub.origin,
             &[
                 "--json",
+                "--include-headers",
                 "api",
                 "call",
-                "getAuditLogChanges",
+                "getAuditLog",
                 "--path",
-                "auditLogId=audit_0197c8f2-5a6b-7cde-8f12-3456789abcde",
+                &format!("auditLogId={id}"),
             ],
             None,
         );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
+        assert_eq!(success(&out), body);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("etag: \"changes\""));
+        assert!(stub.finish()[0].starts_with(&format!("GET /v2/audit-logs/{id} ")));
     }
 }
 
@@ -5366,9 +5251,9 @@ fn invitation_resend_keeps_conflict_visibility_and_uncertainty_without_automatic
 #[test]
 fn workspace_api_key_inventory_preserves_public_metadata_filters_cursors_and_nulls() {
     let id = "api_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let body = json!({"object_type":"WORKSPACE_API_KEY","id":id,"workspace_id":"space_0197c8f2-5a6b-7cde-8f12-3456789abcde","name":"Retained key","description":null,"management_mode":"USER_OWNED","scope":"USER","stack_id":null,"member_id":null,"user_id":null,"expires_at":"2026-10-01T00:00:00.000Z","last_used_at":null,"is_deactivated":true,"deactivated_at":"2026-09-30T13:00:00.123Z","deactivation_reason":"WORKSPACE_USER_REMOVED","created_by_actor_id":"act_0197c8f2-5a6b-7cde-8f12-3456789abcde","deactivated_by_actor_id":null,"created_at":"2026-09-01T10:00:00.000Z","updated_at":"2026-09-01T10:00:00.000Z"});
+    let body = json!({"object_type":"API_KEY","id":id,"workspace_id":"space_0197c8f2-5a6b-7cde-8f12-3456789abcde","name":"Retained key","description":null,"management_mode":"USER_OWNED","scope":"USER","stack_id":null,"member_id":null,"permissions":null,"stack_permissions":null,"expires_at":"2026-10-01T00:00:00.000Z","last_used_at":null,"deactivated_at":"2026-09-30T13:00:00.123Z","deactivation_reason":"WORKSPACE_USER_REMOVED","created_at":"2026-09-01T10:00:00.000Z","updated_at":"2026-09-01T10:00:00.000Z"});
     let page = json!({"object_type":"LIST","data":[body.clone()],"has_more":true,"next_cursor":"opaque+/="});
-    let filter = r#"{"where":{"_and":[{"workspace_api_key[is_deactivated]":{"_true":true}}]}}"#;
+    let filter = r#"{"where":{"_and":[{"api_key[deactivation_reason]":{"_eq":"WORKSPACE_USER_REMOVED"}}]}}"#;
     let stub = Stub::new(vec![
         response("200 OK", page.clone(), ""),
         response("200 OK", body.clone(), "ETag: \"retained\"\r\n"),
@@ -5450,421 +5335,6 @@ fn workspace_api_key_inventory_preserves_current_permission_and_visibility_failu
 }
 
 #[test]
-fn workspace_api_key_revocation_uses_bodyless_delete_and_preserves_empty_success() {
-    let id = "api_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let stub = Stub::new(vec![
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
-    ]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "deleteWorkspaceApiKey",
-            "--path",
-            &format!("apiKeyId={id}"),
-            "--if-match",
-            "\"current-key\"",
-        ],
-        None,
-    );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(out.stdout.is_empty());
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].starts_with(&format!("DELETE /v2/api-keys/{id} ")));
-    assert!(requests[0].to_lowercase().contains("if-match: \"current-key\""));
-    assert!(requests[0].split_once("\r\n\r\n").unwrap().1.is_empty());
-}
-
-#[test]
-fn workspace_api_key_revocation_preserves_authentication_permission_and_stale_failures() {
-    for (status, code) in [
-        ("401 Unauthorized", "revoked_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-        ("412 Precondition Failed", "precondition_failed"),
-    ] {
-        let body = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"revocation-request"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "deleteWorkspaceApiKey",
-                "--path",
-                "apiKeyId=api_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--if-match",
-                "\"current-key\"",
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn workspace_api_key_rotation_preserves_original_credential_without_diagnostic_disclosure() {
-    let id = "api_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let token = "lh-api_synthetic_new_credential";
-    let body = json!({"object_type":"WORKSPACE_API_KEY_TOKEN","id":id,"token":token,"created_at":"2026-09-30T12:00:00.123Z","updated_at":"2026-09-30T13:00:00.123Z"});
-    let stub = Stub::new(vec![response(
-        "200 OK",
-        body.clone(),
-        "Cache-Control: no-store\r\n",
-    )]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "--include-headers",
-            "api",
-            "call",
-            "rotateWorkspaceApiKeyToken",
-            "--path",
-            &format!("apiKeyId={id}"),
-            "--if-match",
-            "\"current\"",
-            "--idempotency-key",
-            "rotate-once",
-        ],
-        None,
-    );
-    assert_eq!(success(&out), body);
-    assert!(!String::from_utf8_lossy(&out.stderr).contains(token));
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].starts_with(&format!("POST /v2/api-keys/{id}/rotate-token ")));
-    let headers = requests[0].to_lowercase();
-    assert!(headers.contains("if-match: \"current\""));
-    assert!(headers.contains("idempotency-key: rotate-once"));
-    assert!(requests[0].split_once("\r\n\r\n").unwrap().1.is_empty());
-}
-
-#[test]
-fn workspace_api_key_rotation_never_retries_uncertain_or_rejected_actions() {
-    for (status, code) in [
-        ("401 Unauthorized", "revoked_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-        ("409 Conflict", "idempotency_outcome_unknown"),
-        ("412 Precondition Failed", "precondition_failed"),
-    ] {
-        let body =
-            json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"rotation-request"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "rotateWorkspaceApiKeyToken",
-                "--path",
-                "apiKeyId=api_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--idempotency-key",
-                "rotate-once",
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn api_key_permission_discovery_preserves_configuration_stack_permissions_cursors_and_validators() {
-    let id = "api_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let stack = "stack_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let configuration = json!({"object_type":"API_KEY_PERMISSION_CONFIGURATION","id":id,"management_mode":"USER_OWNED","workspace_permissions":null,"default_stack_permissions":null,"created_at":"2026-09-30T00:00:00.123Z","updated_at":"2026-09-30T00:00:00.123Z"});
-    let row = json!({"object_type":"API_KEY_STACK_PERMISSIONS","api_key_id":id,"stack_id":stack,"permissions":[{"scope":"STACK","target":"RESOURCES","level":"VIEW"}],"created_at":"2026-09-30T00:00:00.123Z","updated_at":"2026-09-30T00:00:00.123Z"});
-    let page = json!({"object_type":"LIST","data":[row.clone()],"has_more":true,"next_cursor":"next+/="});
-    let filter = r#"{"where":{"_and":[{"api_key_stack_permissions[stack_id]":{"_eq":"stack_0197c8f2-5a6b-7cde-8f12-3456789abcde"}}]}}"#;
-    let stub = Stub::new(vec![
-        response("200 OK", configuration.clone(), "ETag: \"configuration\"\r\n"),
-        response("200 OK", page.clone(), ""),
-        response("200 OK", row.clone(), "ETag: \"override\"\r\n"),
-    ]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "--include-headers",
-            "api",
-            "call",
-            "getWorkspaceApiKeyPermissions",
-            "--path",
-            &format!("apiKeyId={id}"),
-        ],
-        None,
-    );
-    assert_eq!(success(&out), configuration);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("etag: \"configuration\""));
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "listWorkspaceApiKeyStackPermissions",
-            "--path",
-            &format!("apiKeyId={id}"),
-            "--query",
-            "limit=1",
-            "--query",
-            "cursor=previous+/=",
-            "--query",
-            &format!("filter={filter}"),
-        ],
-        None,
-    );
-    assert_eq!(success(&out), page);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "--include-headers",
-            "api",
-            "call",
-            "getWorkspaceApiKeyStackPermissions",
-            "--path",
-            &format!("apiKeyId={id}"),
-            "--path",
-            &format!("stackId={stack}"),
-        ],
-        None,
-    );
-    assert_eq!(success(&out), row);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("etag: \"override\""));
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[0].starts_with(&format!("GET /v2/api-keys/{id}/permissions ")));
-    let url = reqwest::Url::parse(&format!(
-        "http://localhost{}",
-        requests[1].split_whitespace().nth(1).unwrap()
-    ))
-    .unwrap();
-    assert_eq!(url.path(), format!("/v2/api-keys/{id}/stack-permissions"));
-    assert!(
-        url.query_pairs()
-            .any(|(k, v)| k == "cursor" && v == "previous+/=")
-    );
-    assert!(url.query_pairs().any(|(k, v)| k == "filter" && v == filter));
-    assert!(requests[2].starts_with(&format!("GET /v2/api-keys/{id}/stack-permissions/{stack} ")));
-}
-
-#[test]
-fn api_key_permission_discovery_preserves_live_permission_visibility_and_query_failures() {
-    for operation in [
-        "getWorkspaceApiKeyPermissions",
-        "listWorkspaceApiKeyStackPermissions",
-        "getWorkspaceApiKeyStackPermissions",
-    ] {
-        for (status, code) in [
-            ("401 Unauthorized", "disabled_api_key"),
-            ("403 Forbidden", "insufficient_permissions"),
-            ("404 Not Found", "resource_not_found"),
-            ("400 Bad Request", "invalid_filter"),
-        ] {
-            let body = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"permissions-request"});
-            let stub = Stub::new(vec![response(status, body.clone(), "")]);
-            let mut args = vec![
-                "--json",
-                "api",
-                "call",
-                operation,
-                "--path",
-                "apiKeyId=api_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            ];
-            if operation == "getWorkspaceApiKeyStackPermissions" {
-                args.extend(["--path", "stackId=stack_0197c8f2-5a6b-7cde-8f12-3456789abcde"]);
-            }
-            let out = command(&stub.origin, &args, None);
-            assert_eq!(out.status.code(), Some(1));
-            assert!(out.stdout.is_empty());
-            assert_eq!(
-                serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-                body
-            );
-            assert_eq!(stub.finish().len(), 1);
-        }
-    }
-}
-
-#[test]
-fn api_key_stack_permission_removal_uses_bodyless_delete_and_preserves_empty_success() {
-    let api = "api_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let stack = "stack_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let stub = Stub::new(vec![
-        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
-    ]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "deleteWorkspaceApiKeyStackPermissions",
-            "--path",
-            &format!("apiKeyId={api}"),
-            "--path",
-            &format!("stackId={stack}"),
-            "--if-match",
-            "\"current-key\"",
-        ],
-        None,
-    );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(out.stdout.is_empty());
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].starts_with(&format!("DELETE /v2/api-keys/{api}/stack-permissions/{stack} ")));
-    assert!(requests[0].to_lowercase().contains("if-match: \"current-key\""));
-    assert!(requests[0].split_once("\r\n\r\n").unwrap().1.is_empty());
-}
-
-#[test]
-fn api_key_stack_permission_removal_preserves_authentication_permission_and_stale_failures() {
-    for (status, code) in [
-        ("401 Unauthorized", "revoked_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-        ("412 Precondition Failed", "precondition_failed"),
-    ] {
-        let body = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"revocation-request"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "deleteWorkspaceApiKeyStackPermissions",
-                "--path",
-                "apiKeyId=api_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--path",
-                "stackId=stack_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--if-match",
-                "\"current-key\"",
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn context_image_segments_preserve_candidates_normalized_regions_and_cursors() {
-    let image = "ci_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let row = json!({"object_type":"CONTEXT_IMAGE_SEGMENT","context_image_id":image,"segment_id":"seg_0197c8f2-5a6b-7cde-8f12-3456789abcde","language_code":"de","link_type":"SUGGESTION","highlight_boxes":[{"left":0.125,"top":0.25,"width":0.5,"height":0.1}],"is_highlighted":true,"created_at":"2026-09-30T00:00:00.123Z","updated_at":"2026-09-30T00:00:00.123Z"});
-    let page = json!({"object_type":"LIST","data":[row],"has_more":true,"next_cursor":"next+/="});
-    let filter = r#"{"where":{"_and":[{"context_image_segment[link_type]":{"_eq":"SUGGESTION"}}]}}"#;
-    let stub = Stub::new(vec![response("200 OK", page.clone(), "")]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "listContextImageSegments",
-            "--path",
-            &format!("contextImageId={image}"),
-            "--query",
-            "limit=1",
-            "--query",
-            "cursor=previous+/=",
-            "--query",
-            &format!("filter={filter}"),
-        ],
-        None,
-    );
-    assert_eq!(success(&out), page);
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 1);
-    let url = reqwest::Url::parse(&format!(
-        "http://localhost{}",
-        requests[0].split_whitespace().nth(1).unwrap()
-    ))
-    .unwrap();
-    assert_eq!(url.path(), format!("/v2/context-images/{image}/segments"));
-    assert!(url.query_pairs().any(|(k, v)| k == "filter" && v == filter));
-    assert!(
-        url.query_pairs()
-            .any(|(k, v)| k == "cursor" && v == "previous+/=")
-    );
-    assert!(url.query_pairs().any(|(k, v)| k == "limit" && v == "1"));
-}
-
-#[test]
-fn context_image_segments_preserve_empty_regions_and_permission_visibility_errors() {
-    let path = "contextImageId=ci_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let page = json!({"object_type":"LIST","data":[{"highlight_boxes":[],"is_highlighted":true}],"has_more":false,"next_cursor":null});
-    let stub = Stub::new(vec![response("200 OK", page.clone(), "")]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "listContextImageSegments",
-            "--path",
-            path,
-        ],
-        None,
-    );
-    assert_eq!(success(&out), page);
-    assert_eq!(stub.finish().len(), 1);
-    for (status, code) in [
-        ("401 Unauthorized", "disabled_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-        ("400 Bad Request", "invalid_cursor"),
-    ] {
-        let body = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"segment-links-request"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "listContextImageSegments",
-                "--path",
-                path,
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
 fn context_image_detach_posts_segment_ids_and_returns_the_updated_image() {
     let image = "ci_0197c8f2-5a6b-7cde-8f12-3456789abcde";
     let input =
@@ -5939,15 +5409,45 @@ fn context_image_detach_preserves_failures_without_retry() {
     }
 }
 
+fn project_settings_document(id: &str) -> Value {
+    json!({"object_type":"PROJECT_SETTINGS","id":id,
+        "export":{"source_statuses":[],"target_statuses":null,"source_empty_content_handling":"KEEP","target_empty_content_handling":"SKIP","is_not_translatable_skipped":true,"html_encoding":"FUTURE_ENCODING"},
+        "import":{"is_source_creation_enabled":false,"source_text_update_mode":"FUTURE_MODE","is_source_metadata_update_enabled":true,"is_source_deactivation_enabled":false,"is_target_creation_enabled":true,"target_text_update_mode":"NEVER","is_target_metadata_update_enabled":false,"is_target_deactivation_enabled":true},
+        "format":{"general":{"charset":"FUTURE_CHARSET","file_name_languages":"NONE","is_source_used_when_missing":false,"comment_languages":null,"indentation":0,"is_final_newline_enabled":false},"csv":{"is_import_detection_enabled":false,"key_header":"Schlüssel","description_header":"","delimiter":";","quote":"'","is_status_exported":true},"escape":null,"json":{"is_array_indentation_enabled":true,"is_plural_order_alphabetical":false},"i18next_json":{"version":"FUTURE_VERSION","is_base_plural_exported":true},"xliff":null,"properties":{"plural_separator":""}},
+        "keys":{"normalization_strategy":"FORMAT_SPECIFIC"},
+        "placeholders":{"definitions":["IOS_PRINTF","DEFAULT_ICU","IOS_PRINTF","FUTURE_PROFILE"],"default_definitions":["DEFAULT_ICU"],"is_default":false},
+        "integrations":{"is_removed_language_deletion_enabled":true,"is_removed_resource_deletion_enabled":false}})
+}
+
 #[test]
-fn project_placeholder_settings_preserve_order_empty_null_and_future_profiles() {
-    for definitions in [
-        json!(["IOS_PRINTF", "DEFAULT_ICU", "IOS_PRINTF", "FUTURE_PROFILE"]),
-        json!([]),
-        Value::Null,
+fn project_settings_preserve_sections_absence_order_and_future_values() {
+    let id = "pr_0197c8f2-5a6b-7cde-8f12-3456789abcde";
+    let contract = bundled_contract();
+    let complete = project_settings_document(id);
+    let required = contract["components"]["schemas"]["ProjectSettings"]["required"]
+        .as_array()
+        .unwrap();
+    assert_eq!(complete.as_object().unwrap().len(), required.len());
+    for field in required {
+        assert!(complete.get(field.as_str().unwrap()).is_some());
+    }
+    let mut bodies = vec![complete.clone()];
+    for (pointer, value) in [
+        ("/format", Value::Null),
+        ("/integrations", Value::Null),
+        ("/placeholders/definitions", json!([])),
+        ("/placeholders/definitions", Value::Null),
+        ("/keys/normalization_strategy", json!("ALL")),
+        ("/keys/normalization_strategy", json!("NONE")),
+        ("/keys/normalization_strategy", json!("FUTURE_STRATEGY")),
+        ("/keys/normalization_strategy", Value::Null),
     ] {
-        let body = json!({"object_type":"PROJECT_PLACEHOLDER_SETTINGS","id":"pr_0197c8f2-5a6b-7cde-8f12-3456789abcde","definitions":definitions,"default_definitions":["DEFAULT_ICU"],"is_default":false,"created_at":"2026-09-30T00:00:00.000Z","updated_at":"2026-09-30T00:00:00.000Z"});
-        let stub = Stub::new(vec![response("200 OK", body.clone(), "ETag: \"profiles\"\r\n")]);
+        let mut body = complete.clone();
+        *body.pointer_mut(pointer).unwrap() = value;
+        bodies.push(body);
+    }
+    for body in bodies {
+        let stub = Stub::new(vec![response("200 OK", body.clone(), "ETag: \"settings\"\r\n")]);
         let out = command(
             &stub.origin,
             &[
@@ -5955,33 +5455,30 @@ fn project_placeholder_settings_preserve_order_empty_null_and_future_profiles() 
                 "--include-headers",
                 "api",
                 "call",
-                "getProjectPlaceholderSettings",
+                "getProjectSettings",
                 "--path",
-                "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
+                &format!("projectId={id}"),
             ],
             None,
         );
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("profiles"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("etag: \"settings\""));
         let requests = stub.finish();
         assert_eq!(requests.len(), 1);
-        assert!(
-            requests[0].starts_with(
-                "GET /v2/projects/pr_0197c8f2-5a6b-7cde-8f12-3456789abcde/placeholder-settings "
-            )
-        );
+        assert!(requests[0].starts_with(&format!("GET /v2/projects/{id}/settings ")));
     }
 }
 
 #[test]
-fn project_placeholder_settings_preserve_current_permission_failures() {
+fn project_settings_preserve_current_access_errors() {
     for (status, code) in [
         ("401 Unauthorized", "disabled_api_key"),
         ("403 Forbidden", "insufficient_permissions"),
         ("404 Not Found", "resource_not_found"),
     ] {
-        let body = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"placeholder-settings"});
+        let body =
+            json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"project-settings"});
         let stub = Stub::new(vec![response(status, body.clone(), "")]);
         let out = command(
             &stub.origin,
@@ -5989,7 +5486,7 @@ fn project_placeholder_settings_preserve_current_permission_failures() {
                 "--json",
                 "api",
                 "call",
-                "getProjectPlaceholderSettings",
+                "getProjectSettings",
                 "--path",
                 "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
             ],
@@ -6002,159 +5499,6 @@ fn project_placeholder_settings_preserve_current_permission_failures() {
             body
         );
         assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn project_placeholder_reset_posts_without_body_and_preserves_conditional_headers() {
-    let body = json!({"object_type":"PROJECT_PLACEHOLDER_SETTINGS","id":"pr_0197c8f2-5a6b-7cde-8f12-3456789abcde","definitions":["DEFAULT_ICU"],"default_definitions":["DEFAULT_ICU"],"is_default":true,"created_at":"2026-09-30T00:00:00.000Z","updated_at":"2026-09-30T00:01:00.000Z"});
-    let stub = Stub::new(vec![response(
-        "200 OK",
-        body.clone(),
-        "ETag: \"reset-profiles\"\r\n",
-    )]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "--include-headers",
-            "api",
-            "call",
-            "resetProjectPlaceholderSettings",
-            "--path",
-            "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            "--if-match",
-            "\"profiles\"",
-            "--idempotency-key",
-            "reset-once",
-        ],
-        None,
-    );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("reset-profiles"));
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].starts_with(
-        "POST /v2/projects/pr_0197c8f2-5a6b-7cde-8f12-3456789abcde/placeholder-settings/reset "
-    ));
-    assert!(
-        requests[0]
-            .to_ascii_lowercase()
-            .contains("if-match: \"profiles\"")
-    );
-    assert!(
-        requests[0]
-            .to_ascii_lowercase()
-            .contains("idempotency-key: reset-once")
-    );
-    assert!(requests[0].split_once("\r\n\r\n").unwrap().1.is_empty());
-}
-
-#[test]
-fn project_placeholder_reset_preserves_stale_and_current_permission_failures() {
-    for (status, code) in [
-        ("401 Unauthorized", "disabled_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-        ("412 Precondition Failed", "precondition_failed"),
-    ] {
-        let body = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"reset-placeholder-settings"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "resetProjectPlaceholderSettings",
-                "--path",
-                "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn project_import_export_settings_preserve_typed_and_empty_configuration() {
-    for (operation, kind) in [
-        ("getProjectImportSettings", "import"),
-        ("getProjectExportSettings", "export"),
-    ] {
-        let configured = if kind == "import" {
-            json!({"is_source_creation_enabled":false,"source_text_update_mode":"FUTURE_MODE","is_source_metadata_update_enabled":true,"is_source_deactivation_enabled":false,"is_target_creation_enabled":true,"target_text_update_mode":null,"is_target_metadata_update_enabled":false,"is_target_deactivation_enabled":true})
-        } else {
-            json!({"source_statuses":[],"target_statuses":null,"source_empty_content_handling":"KEEP","target_empty_content_handling":null,"is_not_translatable_skipped":true,"html_encoding":"FUTURE_ENCODING"})
-        };
-        let configuration = configured;
-        let body = json!({"object_type":format!("PROJECT_{}_SETTINGS",kind.to_uppercase()),"id":"pr_0197c8f2-5a6b-7cde-8f12-3456789abcde","configuration":configuration,"created_at":"2026-09-30T00:00:00.000Z","updated_at":"2026-09-30T00:00:00.000Z"});
-        let stub = Stub::new(vec![response(
-            "200 OK",
-            body.clone(),
-            "ETag: \"file-settings\"\r\n",
-        )]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "--include-headers",
-                "api",
-                "call",
-                operation,
-                "--path",
-                "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            ],
-            None,
-        );
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("file-settings"));
-        let requests = stub.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with(&format!(
-            "GET /v2/projects/pr_0197c8f2-5a6b-7cde-8f12-3456789abcde/{kind}-settings "
-        )));
-    }
-}
-
-#[test]
-fn project_import_export_settings_preserve_current_access_errors() {
-    for operation in ["getProjectImportSettings", "getProjectExportSettings"] {
-        for (status, code) in [
-            ("401 Unauthorized", "disabled_api_key"),
-            ("403 Forbidden", "insufficient_permissions"),
-            ("404 Not Found", "resource_not_found"),
-        ] {
-            let body = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"project-file-settings"});
-            let stub = Stub::new(vec![response(status, body.clone(), "")]);
-            let out = command(
-                &stub.origin,
-                &[
-                    "--json",
-                    "api",
-                    "call",
-                    operation,
-                    "--path",
-                    "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                ],
-                None,
-            );
-            assert_eq!(out.status.code(), Some(1));
-            assert!(out.stdout.is_empty());
-            assert_eq!(
-                serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-                body
-            );
-            assert_eq!(stub.finish().len(), 1);
-        }
     }
 }
 
@@ -6232,139 +5576,8 @@ fn stack_automation_settings_preserve_current_access_errors() {
 }
 
 #[test]
-fn project_format_settings_preserve_absence_custom_values_and_future_enums() {
-    for configuration in [
-        json!(null),
-        json!({"file":null}),
-        json!({"file":{"general":{"charset":"FUTURE_CHARSET","file_name_languages":"NONE","is_source_used_when_missing":false,"comment_languages":null,"indentation":null,"is_final_newline_enabled":false},"csv":{"is_import_detection_enabled":false,"key_header":"Schlüssel","description_header":"","delimiter":";","quote":"'","is_status_exported":true},"escape":null,"json":{"is_array_indentation_enabled":true,"is_plural_order_alphabetical":false},"i18next_json":{"version":"FUTURE_VERSION","is_base_plural_exported":true},"xliff":null,"properties":{"plural_separator":""}}}),
-    ] {
-        let body = json!({"object_type":"PROJECT_FORMAT_SETTINGS","id":"pr_0197c8f2-5a6b-7cde-8f12-3456789abcde","configuration":configuration,"created_at":"2026-09-30T00:00:00.000Z","updated_at":"2026-09-30T00:00:00.000Z"});
-        let stub = Stub::new(vec![response("200 OK", body.clone(), "ETag: \"formats\"\r\n")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "--include-headers",
-                "api",
-                "call",
-                "getProjectFormatSettings",
-                "--path",
-                "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            ],
-            None,
-        );
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("formats"));
-        let requests = stub.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(
-            requests[0]
-                .starts_with("GET /v2/projects/pr_0197c8f2-5a6b-7cde-8f12-3456789abcde/format-settings ")
-        );
-    }
-}
-
-#[test]
-fn project_format_settings_preserve_current_access_errors() {
-    for (status, code) in [
-        ("401 Unauthorized", "disabled_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-    ] {
-        let body = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"formats"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "getProjectFormatSettings",
-                "--path",
-                "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn project_key_settings_preserve_strategy_absence_and_future_values() {
-    for strategy in [
-        json!("FORMAT_SPECIFIC"),
-        json!("ALL"),
-        json!("NONE"),
-        json!("FUTURE_STRATEGY"),
-        json!(null),
-    ] {
-        let body = json!({"object_type":"PROJECT_KEY_SETTINGS","id":"pr_0197c8f2-5a6b-7cde-8f12-3456789abcde","normalization_strategy":strategy,"created_at":"2026-09-30T00:00:00.000Z","updated_at":"2026-09-30T00:00:00.000Z"});
-        let stub = Stub::new(vec![response("200 OK", body.clone(), "ETag: \"keys\"\r\n")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "--include-headers",
-                "api",
-                "call",
-                "getProjectKeySettings",
-                "--path",
-                "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            ],
-            None,
-        );
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("keys"));
-        let requests = stub.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(
-            requests[0].starts_with("GET /v2/projects/pr_0197c8f2-5a6b-7cde-8f12-3456789abcde/key-settings ")
-        );
-    }
-}
-
-#[test]
-fn project_key_settings_preserve_current_access_errors() {
-    for (status, code) in [
-        ("401 Unauthorized", "disabled_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-    ] {
-        let body = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"keys"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "getProjectKeySettings",
-                "--path",
-                "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
 fn distribution_configuration_preserves_nullable_ranges_and_future_enums() {
-    let body = json!({"object_type":"DISTRIBUTION","id":"dtb_0197c8f2-5a6b-7cde-8f12-3456789abcde","project_id":"pr_0197c8f2-5a6b-7cde-8f12-3456789abcde","name":"Österreich","type":"FUTURE_TYPE","environment":"FUTURE_ENVIRONMENT","release_schedule":"FUTURE_SCHEDULE","is_fallback":false,"version_from":"","version_to":null,"created_at":"2026-09-30T00:00:00.000Z","updated_at":"2026-09-30T00:00:00.000Z"});
+    let body = json!({"object_type":"DISTRIBUTION","id":"dtb_0197c8f2-5a6b-7cde-8f12-3456789abcde","project_id":"pr_0197c8f2-5a6b-7cde-8f12-3456789abcde","name":"Österreich","type":"FUTURE_TYPE","environment":"FUTURE_ENVIRONMENT","is_fallback":false,"version_from":"","version_to":null,"created_at":"2026-09-30T00:00:00.000Z","updated_at":"2026-09-30T00:00:00.000Z"});
     let stub = Stub::new(vec![response(
         "200 OK",
         body.clone(),
@@ -6560,152 +5773,6 @@ fn distribution_release_reads_preserve_current_access_errors() {
     }
 }
 
-#[test]
-fn distribution_release_logs_transmit_level_filter_and_cursor() {
-    let body = json!({"object_type":"LIST","has_more":true,"next_cursor":"opaque-next","data":[{"object_type":"DISTRIBUTION_RELEASE_LOG","level":"WARN","content":"Österreich","created_at":"2026-09-30T00:00:00.000Z"}]});
-    let filter = r#"{"where":{"_and":[{"distribution_release_log[level]":{"_eq":"WARN"}}]}}"#;
-    let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "listDistributionReleaseLogs",
-            "--path",
-            "distributionReleaseId=rel_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            "--query",
-            "limit=1",
-            "--query",
-            "cursor=opaque-input",
-            "--query",
-            &format!("filter={filter}"),
-        ],
-        None,
-    );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 1);
-    let line = requests[0].lines().next().unwrap();
-    assert!(line.starts_with("GET /v2/distribution-releases/rel_0197c8f2-5a6b-7cde-8f12-3456789abcde/logs?"));
-    assert!(line.contains("limit=1"));
-    assert!(line.contains("cursor=opaque-input"));
-    assert!(line.contains("filter="));
-    assert!(line.contains("WARN"));
-}
-
-#[test]
-fn distribution_release_logs_preserve_empty_history_and_access_errors() {
-    for (status, body) in [
-        (
-            "200 OK",
-            json!({"object_type":"LIST","has_more":false,"next_cursor":null,"data":[]}),
-        ),
-        (
-            "403 Forbidden",
-            json!({"status":403,"code":"insufficient_permissions","request_id":"release-log"}),
-        ),
-        (
-            "404 Not Found",
-            json!({"status":404,"code":"resource_not_found","request_id":"release-log"}),
-        ),
-    ] {
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "listDistributionReleaseLogs",
-                "--path",
-                "distributionReleaseId=rel_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            ],
-            None,
-        );
-        if status == "200 OK" {
-            assert!(out.status.success());
-            assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), body);
-        } else {
-            assert_eq!(out.status.code(), Some(1));
-            assert!(out.stdout.is_empty());
-            assert_eq!(
-                serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-                body
-            );
-        }
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn distribution_release_deletion_forwards_condition_and_accepts_no_content() {
-    let stub = Stub::new(vec![
-        "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into(),
-    ]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "--if-match",
-            "\"release-version\"",
-            "api",
-            "call",
-            "deleteDistributionRelease",
-            "--path",
-            "distributionReleaseId=rel_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-        ],
-        None,
-    );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(out.stdout.is_empty());
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 1);
-    assert!(
-        requests[0].starts_with("DELETE /v2/distribution-releases/rel_0197c8f2-5a6b-7cde-8f12-3456789abcde ")
-    );
-    assert!(
-        requests[0]
-            .to_lowercase()
-            .contains("if-match: \"release-version\"")
-    );
-}
-
-#[test]
-fn distribution_release_deletion_preserves_stale_and_current_access_problems() {
-    for (status, code) in [
-        ("412 Precondition Failed", "precondition_failed"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-    ] {
-        let body =
-            json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"release-delete"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "deleteDistributionRelease",
-                "--path",
-                "distributionReleaseId=rel_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--if-match",
-                "\"old-release\"",
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
 fn release_download(origin: &str, destination: &std::path::Path, extra: &[&str]) -> std::process::Output {
     let mut args = vec![
         "--json",
@@ -6719,7 +5786,7 @@ fn release_download(origin: &str, destination: &std::path::Path, extra: &[&str])
     command(origin, &args, None)
 }
 fn release_download_metadata(url: Value) -> Value {
-    json!({"object_type":"DISTRIBUTION_RELEASE_DOWNLOAD", "id":"rel_0197c8f2-5a6b-7cde-8f12-3456789abcde", "download_url":url, "download_url_expires_at":"2026-09-30T22:00:00.000Z"})
+    json!({"object_type":"DISTRIBUTION_RELEASE", "id":"rel_0197c8f2-5a6b-7cde-8f12-3456789abcde", "status":"SUCCEEDED", "download_url":url, "download_url_expires_at":"2026-09-30T22:00:00.000Z"})
 }
 #[test]
 fn release_download_refreshes_metadata_and_keeps_credentials_off_artifact_requests() {
@@ -6745,10 +5812,7 @@ fn release_download_refreshes_metadata_and_keeps_credentials_off_artifact_reques
     assert_eq!(std::fs::read(&destination).unwrap(), bytes);
     assert!(String::from_utf8_lossy(&out.stderr).contains("release-req"));
     let request = &api.finish()[0];
-    assert!(
-        request
-            .starts_with("GET /v2/distribution-releases/rel_0197c8f2-5a6b-7cde-8f12-3456789abcde/download ")
-    );
+    assert!(request.starts_with("GET /v2/distribution-releases/rel_0197c8f2-5a6b-7cde-8f12-3456789abcde "));
     assert!(
         request
             .to_lowercase()
@@ -6771,21 +5835,42 @@ fn release_download_refreshes_metadata_and_keeps_credentials_off_artifact_reques
 fn release_download_rejects_unavailable_or_mismatched_metadata_before_storage() {
     let trap = Stub::new(vec![]);
     let mut wrong_kind = release_download_metadata(json!(format!("{}/archive.zip", trap.origin)));
-    wrong_kind["object_type"] = json!("EXPORT");
+    wrong_kind["object_type"] = json!("DISTRIBUTION_RELEASE_DOWNLOAD");
     let mut wrong_id = release_download_metadata(json!(format!("{}/archive.zip", trap.origin)));
     wrong_id["id"] = json!("rel_other");
+    let with_status = |status: Value| {
+        let mut metadata = release_download_metadata(json!(format!("{}/archive.zip", trap.origin)));
+        metadata["status"] = status;
+        metadata
+    };
     for (metadata, expected_error) in [
         (
             release_download_metadata(Value::Null),
-            "No completed archive is available; inspect the distribution release status before downloading",
+            "No completed archive is available; inspect the distribution release before downloading",
+        ),
+        (
+            with_status(json!("PROCESSING")),
+            "Distribution release is not finished; inspect its status before downloading",
+        ),
+        (
+            with_status(json!("FAILED")),
+            "Distribution release did not succeed; inspect its export before downloading",
+        ),
+        (
+            with_status(json!("FUTURE_STATUS")),
+            "Distribution release has an unrecognized status",
+        ),
+        (
+            with_status(Value::Null),
+            "Distribution release has an unrecognized status",
         ),
         (
             wrong_kind,
-            "Download metadata does not match the requested distribution release",
+            "Release metadata does not match the requested distribution release",
         ),
         (
             wrong_id,
-            "Download metadata does not match the requested distribution release",
+            "Release metadata does not match the requested distribution release",
         ),
         (
             release_download_metadata(json!("http://untrusted.invalid/archive.zip")),
@@ -6896,239 +5981,12 @@ fn release_download_rejects_unexpected_success_status_before_storage() {
             "",
         )]);
         let out = release_download(&api.origin, &destination, &[]);
-        assert_download_metadata_error(&out, "Expected HTTP 200 download metadata");
+        assert_download_metadata_error(&out, "Expected HTTP 200 distribution release metadata");
         assert!(!destination.exists());
         assert_eq!(api.finish().len(), 1);
         assert_no_staging(&fixture);
     }
     trap.finish();
-}
-
-#[test]
-fn distribution_deletion_forwards_condition_and_accepts_no_content() {
-    let stub = Stub::new(vec![
-        "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into(),
-    ]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "--if-match",
-            "\"release-version\"",
-            "api",
-            "call",
-            "deleteDistribution",
-            "--path",
-            "distributionId=dtb_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-        ],
-        None,
-    );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(out.stdout.is_empty());
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].starts_with("DELETE /v2/distributions/dtb_0197c8f2-5a6b-7cde-8f12-3456789abcde "));
-    assert!(
-        requests[0]
-            .to_lowercase()
-            .contains("if-match: \"release-version\"")
-    );
-}
-
-#[test]
-fn distribution_deletion_preserves_stale_and_current_access_problems() {
-    for (status, code) in [
-        ("412 Precondition Failed", "precondition_failed"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-    ] {
-        let body =
-            json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"release-delete"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "deleteDistribution",
-                "--path",
-                "distributionId=dtb_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--if-match",
-                "\"old-release\"",
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn cdn_key_inventory_preserves_public_metadata_filters_and_cursors() {
-    let id = "cdn_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let project = "pr_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let metadata = json!({"object_type":"CDN_KEY","id":id,"project_id":project,"name":"Production","last_used_at":null,"created_at":"2026-09-30T00:00:00.000Z","updated_at":"2026-09-30T00:00:00.000Z"});
-    let page =
-        json!({"object_type":"LIST","has_more":true,"next_cursor":"next-key","data":[metadata.clone()]});
-    let filter = r#"{"where":{"_and":[{"cdn_key[name]":{"_eq":"Production"}}]}}"#;
-    let stub = Stub::new(vec![
-        response("200 OK", page.clone(), ""),
-        response("200 OK", metadata.clone(), "ETag: \"key-state\"\r\n"),
-    ]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "listProjectCdnKeys",
-            "--path",
-            &format!("projectId={project}"),
-            "--query",
-            &format!("filter={filter}"),
-            "--query",
-            "cursor=previous",
-            "--query",
-            "limit=1",
-        ],
-        None,
-    );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), page);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "getCdnKey",
-            "--path",
-            &format!("cdnKeyId={id}"),
-            "--include-headers",
-        ],
-        None,
-    );
-    assert!(out.status.success());
-    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), metadata);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("etag: \"key-state\""));
-    let requests = stub.finish();
-    assert!(requests[0].starts_with(&format!("GET /v2/projects/{project}/cdn-keys?")));
-    let target = reqwest::Url::parse(&format!(
-        "http://localhost{}",
-        requests[0].split_whitespace().nth(1).unwrap()
-    ))
-    .unwrap();
-    let query: std::collections::BTreeMap<_, _> = target.query_pairs().into_owned().collect();
-    assert_eq!(query.len(), 3);
-    assert_eq!(query.get("cursor").map(String::as_str), Some("previous"));
-    assert_eq!(query.get("limit").map(String::as_str), Some("1"));
-    assert_eq!(query.get("filter").map(String::as_str), Some(filter));
-    assert!(requests[1].starts_with(&format!("GET /v2/cdn-keys/{id} HTTP/1.1")));
-}
-
-#[test]
-fn cdn_key_inventory_preserves_current_permission_and_visibility_errors() {
-    for (status, code) in [
-        ("401 Unauthorized", "disabled_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-    ] {
-        for (operation, path) in [
-            ("getCdnKey", "cdnKeyId=cdn_0197c8f2-5a6b-7cde-8f12-3456789abcde"),
-            (
-                "listProjectCdnKeys",
-                "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            ),
-        ] {
-            let body =
-                json!({"code":code,"status":status[..3].parse::<u16>().unwrap(),"detail":"Unavailable"});
-            let stub = Stub::new(vec![response(status, body.clone(), "")]);
-            let out = command(
-                &stub.origin,
-                &["--json", "api", "call", operation, "--path", path],
-                None,
-            );
-            assert_eq!(out.status.code(), Some(1));
-            assert!(out.stdout.is_empty());
-            assert_eq!(
-                serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-                body
-            );
-            assert_eq!(stub.finish().len(), 1);
-        }
-    }
-}
-
-#[test]
-fn cdn_key_deletion_forwards_condition_and_accepts_no_content() {
-    for condition in [None, Some("\"key-version\""), Some("*")] {
-        let stub = Stub::new(vec![
-            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into(),
-        ]);
-        let mut args = vec![
-            "--json",
-            "api",
-            "call",
-            "deleteCdnKey",
-            "--path",
-            "cdnKeyId=cdn_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-        ];
-        if let Some(value) = condition {
-            args.extend(["--if-match", value]);
-        }
-        let out = command(&stub.origin, &args, None);
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert!(out.stdout.is_empty());
-        let requests = stub.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with("DELETE /v2/cdn-keys/cdn_0197c8f2-5a6b-7cde-8f12-3456789abcde "));
-        let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
-        assert!(body.is_empty());
-        match condition {
-            Some(value) => assert!(headers.to_lowercase().contains(&format!("if-match: {value}"))),
-            None => assert!(!headers.to_lowercase().contains("if-match:")),
-        }
-    }
-}
-
-#[test]
-fn cdn_key_deletion_preserves_stale_and_current_access_problems() {
-    for (status, code) in [
-        ("412 Precondition Failed", "precondition_failed"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-    ] {
-        let body =
-            json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"key-delete"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "deleteCdnKey",
-                "--path",
-                "cdnKeyId=cdn_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--if-match",
-                "\"old-key\"",
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
 }
 
 #[test]
@@ -7222,10 +6080,9 @@ fn bundled_statistics_schema_preserves_required_nullable_and_typed_values() {
             .contains(&json!("key_counts"))
     );
     let counts = &release["properties"]["key_counts"];
-    assert_eq!(counts["nullable"], true);
     assert_eq!(
-        counts["oneOf"][0]["$ref"],
-        "#/components/schemas/DistributionReleaseKeyCountSnapshot"
+        counts["oneOf"],
+        json!([{"$ref":"#/components/schemas/DistributionReleaseKeyCountSnapshot"},{"type":"null"}])
     );
     let snapshot = &schemas["DistributionReleaseKeyCountSnapshot"];
     for field in ["total", "entries"] {
@@ -7292,8 +6149,7 @@ fn bundled_statistics_schema_preserves_required_nullable_and_typed_values() {
                 .contains(&json!(field))
         );
         let property = &schemas[schema]["properties"][field];
-        assert_eq!(property["nullable"], true);
-        assert_eq!(property["type"], "integer");
+        assert_eq!(property["type"], json!(["integer", "null"]));
         assert_eq!(property["format"], format);
         assert_eq!(property["minimum"], 0);
     }
@@ -7376,7 +6232,7 @@ fn bodyless_named_operations_reject_fields_files_and_stdin_before_io() {
         ("getBackupSettings", "projectId=pr_123"),
         ("deleteStack", "stackId=stack_123"),
         ("resendInvitation", "invitationId=inv_123"),
-        ("activateDistributionRelease", "distributionReleaseId=rel_123"),
+        ("setDefaultBranch", "branchId=prb_123"),
     ] {
         for flags in [
             ["--field", "unexpected=true"],
@@ -7403,125 +6259,25 @@ fn bodyless_named_operations_reject_fields_files_and_stdin_before_io() {
 }
 
 #[test]
-fn release_activation_forwards_conditions_idempotency_and_complete_metadata() {
-    let id = "rel_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let metadata = json!({
-        "object_type":"DISTRIBUTION_RELEASE", "id":id,
-        "distribution_id":"dtb_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-        "project_id":"pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-        "status":"SUCCEEDED", "activated_at":"2026-10-01T04:00:00.123456Z",
-        "name":"October β", "branch_name":"main", "language_codes":["en","de"],
-        "archive_size_kib":12, "file_count":2,
-        "created_at":"2026-10-01T03:00:00.123456Z", "updated_at":"2026-10-01T04:00:00.123456Z",
-        "key_counts":{"total":5,"entries":[
-            {"file_path":"en.json","language_codes":["en"],"key_count":5},
-            {"file_path":"de.json","language_codes":["de"],"key_count":0}
-        ]}
-    });
-    let contract: Value = serde_json::from_str(include_str!("../contract/v2.json")).unwrap();
-    for field in contract["components"]["schemas"]["DistributionRelease"]["required"]
-        .as_array()
-        .unwrap()
-    {
-        assert!(
-            metadata.get(field.as_str().unwrap()).is_some(),
-            "missing required field: {field}"
-        );
-    }
-    for condition in [None, Some("*"), Some("\"release-version\"")] {
-        let stub = Stub::new(vec![response("200 OK", metadata.clone(), "")]);
-        let path = format!("distributionReleaseId={id}");
-        let mut args = vec![
-            "--json",
-            "api",
-            "call",
-            "activateDistributionRelease",
-            "--path",
-            &path,
-            "--idempotency-key",
-            "activate-once",
-        ];
-        if let Some(value) = condition {
-            args.extend(["--if-match", value]);
-        }
-        let out = command(&stub.origin, &args, None);
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), metadata);
-        let requests = stub.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with(&format!("POST /v2/distribution-releases/{id}/activate HTTP/1.1")));
-        let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
-        assert!(body.is_empty());
-        assert!(headers.to_lowercase().contains("idempotency-key: activate-once"));
-        match condition {
-            Some(value) => assert!(headers.to_lowercase().contains(&format!("if-match: {value}"))),
-            None => assert!(!headers.to_lowercase().contains("if-match:")),
-        }
-    }
-}
-
-#[test]
-fn release_activation_preserves_count_state_and_access_problems_without_retry() {
-    for (status, code) in [
-        ("409 Conflict", "distribution_release_not_ready"),
-        ("409 Conflict", "distribution_release_counts_unavailable"),
-        ("409 Conflict", "distribution_release_empty"),
-        ("412 Precondition Failed", "precondition_failed"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-    ] {
-        let body = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"release-activation"});
-        let stub = Stub::new(vec![response(status, body.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "activateDistributionRelease",
-                "--path",
-                "distributionReleaseId=rel_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            body
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn highlight_attachment_preserves_exact_decimals_flag_replay_key_and_response() {
+fn highlight_attachment_preserves_pixel_boxes_order_replay_key_and_response() {
     let image = "ci_0197c8f2-5a6b-7cde-8f12-3456789abcde";
     let segment = "seg_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let contract: Value = serde_json::from_str(include_str!("../contract/v2.json")).unwrap();
+    let contract = bundled_contract();
+    let schemas = &contract["components"]["schemas"];
     assert_eq!(
-        contract["components"]["schemas"]["AttachContextImageHighlights"]["required"],
-        json!(["highlight_boxes", "is_highlighted"])
+        schemas["AttachContextImageSegment"]["required"],
+        json!(["segment_id"])
     );
     assert_eq!(
-        contract["components"]["schemas"]["SetContextImageHighlightBox"]["required"],
+        schemas["ContextImageHighlightBox"]["required"],
         json!(["height", "left", "top", "width"])
     );
-    for field in ["left", "top", "width", "height"] {
-        let property = &contract["components"]["schemas"]["SetContextImageHighlightBox"]["properties"][field];
-        assert_eq!(property["multipleOf"].as_f64(), Some(1e-20));
-        assert!(
-            property["description"]
-                .as_str()
-                .unwrap()
-                .contains("21 significant digits")
-        );
-        assert!(
-            property["description"]
-                .as_str()
-                .unwrap()
-                .contains("scale -20 through 20")
-        );
+    // Boxes are whole pixels: positions start at 0, extents at 1.
+    for (field, minimum) in [("left", 0), ("top", 0), ("width", 1), ("height", 1)] {
+        let property = &schemas["ContextImageHighlightBox"]["properties"][field];
+        assert_eq!(property["type"], "integer");
+        assert_eq!(property["format"], "int32");
+        assert_eq!(property["minimum"], minimum);
     }
     let expected = json!({"object_type":"CONTEXT_IMAGE","id":image,"project_id":"pr_0197c8f2-5a6b-7cde-8f12-3456789abcde","language_code":"de","name":"Checkout","description":null,"url":"https://cdn.example.test/ci.png","width":800,"height":600,"upload_status":"DONE","content_hash":"abc","capture_key":null,"app_version":null,"captured_at":null,"attachments":[],"created_at":"2026-10-01T00:00:00.123Z","updated_at":"2026-10-01T00:00:00.456Z"});
     let required = contract["components"]["schemas"]["ContextImage"]["required"]
@@ -7532,21 +6288,15 @@ fn highlight_attachment_preserves_exact_decimals_flag_replay_key_and_response() 
         assert!(expected.get(field.as_str().unwrap()).is_some());
     }
     for (highlights, replay_key) in [
+        (r#"[{"left":0,"top":0,"width":1,"height":2147483647}]"#, None),
         (
-            r#"{"highlight_boxes":[{"left":0.99999999999999999999,"top":0,"width":0.00000000000000000001,"height":1}],"is_highlighted":true}"#,
-            None,
-        ),
-        (
-            r#"{"highlight_boxes":[{"left":0.75,"top":0.5,"width":0.25,"height":0.25},{"left":0.125,"top":0.25,"width":0.5,"height":0.1}],"is_highlighted":true}"#,
+            r#"[{"left":600,"top":300,"width":200,"height":150},{"left":100,"top":150,"width":400,"height":60}]"#,
             Some("ordered"),
         ),
-        (r#"{"highlight_boxes":[],"is_highlighted":true}"#, Some("cleared")),
-        (
-            r#"{"highlight_boxes":[],"is_highlighted":false}"#,
-            Some("unhighlighted"),
-        ),
+        ("[]", Some("cleared")),
+        ("null", Some("unhighlighted")),
     ] {
-        let body = format!(r#"{{"segments":[{{"segment_id":"{segment}","highlights":{highlights}}}]}}"#);
+        let body = format!(r#"{{"segments":[{{"segment_id":"{segment}","highlight_boxes":{highlights}}}]}}"#);
         let input: Value = serde_json::from_str(&body).unwrap();
         let stub = Stub::new(vec![response(
             "200 OK",
@@ -7594,7 +6344,7 @@ fn highlight_attachment_preserves_problems_and_never_retries_the_write() {
         ("409 Conflict", "idempotency_outcome_unknown"),
         ("422 Unprocessable Entity", "validation_failed"),
     ] {
-        let problem = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"highlights","errors":[{"pointer":"#/segments/0/highlights/highlight_boxes/0/width","code":"not_supported","detail":"Left plus width must not exceed one."}]});
+        let problem = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"highlights","errors":[{"pointer":"#/segments/0/highlight_boxes/0/width","code":"not_supported","detail":"The box must lie inside the image."}]});
         let stub = Stub::new(vec![response(status, problem.clone(), "")]);
         let out = command(
             &stub.origin,
@@ -7611,7 +6361,7 @@ fn highlight_attachment_preserves_problems_and_never_retries_the_write() {
                 "-",
             ],
             Some(
-                r#"{"segments":[{"segment_id":"seg_0197c8f2-5a6b-7cde-8f12-3456789abcde","highlights":{"highlight_boxes":[{"left":0.5,"top":0,"width":0.6,"height":1}],"is_highlighted":true}}]}"#,
+                r#"{"segments":[{"segment_id":"seg_0197c8f2-5a6b-7cde-8f12-3456789abcde","highlight_boxes":[{"left":400,"top":0,"width":480,"height":600}]}]}"#,
             ),
         );
         assert_eq!(out.status.code(), Some(1));
@@ -7625,520 +6375,61 @@ fn highlight_attachment_preserves_problems_and_never_retries_the_write() {
 }
 
 #[test]
-fn stack_permission_replacement_preserves_all_public_levels_and_conditions() {
-    let contract: Value = serde_json::from_str(include_str!("../contract/v2.json")).unwrap();
-    assert_eq!(
-        contract["components"]["schemas"]["SetApiKeyStackPermissions"]["required"],
-        json!([
-            "activities",
-            "context_images",
-            "general",
-            "languages",
-            "resources",
-            "segment_keys",
-            "segment_texts",
-            "segments",
-            "settings"
-        ])
-    );
-    let operation = &contract["paths"]["/v2/api-keys/{apiKeyId}/stack-permissions/{stackId}"]["put"];
-    assert!(operation["responses"]["200"]["headers"].get("ETag").is_none());
-    let api = "api_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let stack = "stack_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let body = json!({"general":"VIEW","settings":"MANAGE","activities":"NO_ACCESS","resources":"VIEW","context_images":"MANAGE","languages":"NO_ACCESS","segment_keys":"VIEW","segments":"MANAGE","segment_texts":"NO_ACCESS"});
-    let permissions: Vec<Value> = body
-        .as_object()
-        .unwrap()
-        .iter()
-        .map(|(name, level)| json!({"scope":"STACK","target":name.to_uppercase(),"level":level}))
-        .collect();
-    let expected = json!({"object_type":"API_KEY_STACK_PERMISSIONS","api_key_id":api,"stack_id":stack,"permissions":permissions,"created_at":"2026-10-01T00:00:00.123Z","updated_at":"2026-10-01T01:00:00.456Z"});
-    let required = contract["components"]["schemas"]["ApiKeyStackPermissions"]["required"]
-        .as_array()
-        .unwrap();
-    assert_eq!(expected.as_object().unwrap().len(), required.len());
-    for field in required {
-        assert!(expected.get(field.as_str().unwrap()).is_some());
-    }
-    for condition in [None, Some("*"), Some("\"override\"")] {
-        let stub = Stub::new(vec![response("200 OK", expected.clone(), "")]);
-        let api_path = format!("apiKeyId={api}");
-        let stack_path = format!("stackId={stack}");
-        let mut args = vec![
-            "--json",
-            "api",
-            "call",
-            "setWorkspaceApiKeyStackPermissions",
-            "--path",
-            &api_path,
-            "--path",
-            &stack_path,
-            "--file",
-            "-",
-            "--include-headers",
-        ];
-        if let Some(value) = condition {
-            args.extend(["--if-match", value]);
-        }
-        let out = command(&stub.origin, &args, Some(&body.to_string()));
-        assert_eq!(success(&out), expected);
-        assert!(
-            !String::from_utf8_lossy(&out.stderr)
-                .to_lowercase()
-                .contains("etag:")
-        );
-        let requests = stub.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with(&format!("PUT /v2/api-keys/{api}/stack-permissions/{stack} ")));
-        let (headers, payload) = requests[0].split_once("\r\n\r\n").unwrap();
-        assert_eq!(serde_json::from_str::<Value>(payload).unwrap(), body);
-        match condition {
-            Some(value) => assert!(headers.to_lowercase().contains(&format!("if-match: {value}"))),
-            None => assert!(!headers.to_lowercase().contains("if-match:")),
-        }
-    }
-}
-
-#[test]
-fn stack_permission_replacement_retains_errors_without_retrying() {
-    for (status, code) in [
-        ("401 Unauthorized", "disabled_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-        ("412 Precondition Failed", "precondition_failed"),
-        ("422 Unprocessable Content", "validation_failed"),
+fn project_settings_patch_preserves_sections_order_empty_null_and_condition() {
+    let contract = bundled_contract();
+    let schemas = &contract["components"]["schemas"];
+    // A merge patch names only what changes, so no section or field may be required.
+    for schema in [
+        "UpdateProjectSettings",
+        "UpdateProjectPlaceholderSettings",
+        "UpdateProjectKeySettings",
+        "UpdateProjectImportSettings",
+        "UpdateProjectExportSettings",
+        "UpdateProjectFormatSettings",
     ] {
-        let mut error = json!({
-            "type": "about:blank",
-            "title": &status[4..],
-            "status": status[..3].parse::<u16>().unwrap(),
-            "detail": "The permission replacement could not be completed.",
-            "instance": "/v2/api-keys/api_0197c8f2-5a6b-7cde-8f12-3456789abcde/stack-permissions/stack_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-            "code": code,
-            "request_id": "override-permissions",
-            "errors": []
-        });
-        if code == "validation_failed" {
-            error["errors"] = json!([{"pointer":"#/segment_texts","parameter":null,"code":"required","detail":"A level is required."}]);
-        }
-        let stub = Stub::new(vec![response(status, error.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "setWorkspaceApiKeyStackPermissions",
-                "--path",
-                "apiKeyId=api_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--path",
-                "stackId=stack_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--file",
-                "-",
-            ],
-            Some("{}"),
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        let actual: Value = serde_json::from_slice(&out.stderr).unwrap();
-        assert_eq!(actual["problem"], error);
-        assert_eq!(stub.finish().len(), 1);
+        assert!(schemas[schema].get("required").is_none(), "{schema}");
+        assert_eq!(schemas[schema]["additionalProperties"], false, "{schema}");
     }
-}
-
-#[test]
-fn default_stack_permission_replacement_preserves_all_public_levels_and_conditions() {
-    let contract: Value = serde_json::from_str(include_str!("../contract/v2.json")).unwrap();
-    assert_eq!(
-        contract["components"]["schemas"]["SetApiKeyDefaultStackPermissions"]["required"],
-        json!([
-            "activities",
-            "context_images",
-            "general",
-            "languages",
-            "resources",
-            "segment_keys",
-            "segment_texts",
-            "segments",
-            "settings"
-        ])
-    );
-    let operation = &contract["paths"]["/v2/api-keys/{apiKeyId}/default-stack-permissions"]["put"];
-    assert!(operation["responses"]["200"]["headers"].get("ETag").is_none());
-    let id = "api_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let body = json!({"general":"VIEW","settings":"MANAGE","activities":"NO_ACCESS","resources":"VIEW","context_images":"MANAGE","languages":"NO_ACCESS","segment_keys":"VIEW","segments":"MANAGE","segment_texts":"NO_ACCESS"});
-    let permissions: Vec<Value> = [
-        "GENERAL",
-        "SETTINGS",
-        "ACTIVITIES",
-        "RESOURCES",
-        "CONTEXT_IMAGES",
-        "LANGUAGES",
-        "SEGMENT_KEYS",
-        "SEGMENTS",
-        "SEGMENT_TEXTS",
-    ]
-    .iter()
-    .map(|target| json!({"scope":"STACK","target":target,"level":body[target.to_lowercase()]}))
-    .collect();
-    let workspace_permissions: Vec<Value> = [
-        "BILLING_SUBSCRIPTION",
-        "WORKSPACES",
-        "MEMBERS",
-        "PLUGINS_INTEGRATIONS",
-        "LOGS",
-        "API_ACCESS",
-        "STACKS",
-        "TRANSLATION_ORDERS",
-        "WORK_REPORTS",
-        "STYLE_GUIDES",
-        "GLOSSARIES",
-        "TRANSLATION_MEMORIES",
-        "LABELS",
-        "AI_TRANSLATION",
-    ]
-    .iter()
-    .map(|target| json!({"scope":"WORKSPACE","target":target,"level":"NO_ACCESS"}))
-    .collect();
-    let expected = json!({"object_type":"API_KEY_PERMISSION_CONFIGURATION","id":id,"management_mode":"WORKSPACE_MANAGED","workspace_permissions":workspace_permissions,"default_stack_permissions":permissions,"created_at":"2026-10-01T00:00:00.123Z","updated_at":"2026-10-01T01:00:00.456Z"});
-    let required = contract["components"]["schemas"]["ApiKeyPermissionConfiguration"]["required"]
-        .as_array()
-        .unwrap();
-    assert_eq!(expected.as_object().unwrap().len(), required.len());
-    for field in required {
-        assert!(expected.get(field.as_str().unwrap()).is_some());
-    }
-    for condition in [None, Some("*"), Some("\"override\"")] {
-        let stub = Stub::new(vec![response("200 OK", expected.clone(), "")]);
-        let path = format!("apiKeyId={id}");
-        let mut args = vec![
-            "--json",
-            "api",
-            "call",
-            "setWorkspaceApiKeyDefaultStackPermissions",
-            "--path",
-            &path,
-            "--file",
-            "-",
-            "--include-headers",
-        ];
-        if let Some(value) = condition {
-            args.extend(["--if-match", value]);
-        }
-        let out = command(&stub.origin, &args, Some(&body.to_string()));
-        assert_eq!(success(&out), expected);
-        assert!(
-            !String::from_utf8_lossy(&out.stderr)
-                .to_lowercase()
-                .contains("etag:")
-        );
-        let requests = stub.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with(&format!("PUT /v2/api-keys/{id}/default-stack-permissions ")));
-        let (headers, payload) = requests[0].split_once("\r\n\r\n").unwrap();
-        assert_eq!(serde_json::from_str::<Value>(payload).unwrap(), body);
-        match condition {
-            Some(value) => assert!(headers.to_lowercase().contains(&format!("if-match: {value}"))),
-            None => assert!(!headers.to_lowercase().contains("if-match:")),
-        }
-    }
-}
-
-#[test]
-fn default_stack_permission_replacement_retains_errors_without_retrying() {
-    for (status, code) in [
-        ("401 Unauthorized", "disabled_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-        ("412 Precondition Failed", "precondition_failed"),
-        ("422 Unprocessable Content", "validation_failed"),
-    ] {
-        let mut error = json!({
-            "type": "about:blank",
-            "title": &status[4..],
-            "status": status[..3].parse::<u16>().unwrap(),
-            "detail": "The permission replacement could not be completed.",
-            "instance": "/v2/api-keys/api_0197c8f2-5a6b-7cde-8f12-3456789abcde/default-stack-permissions",
-            "code": code,
-            "request_id": "override-permissions",
-            "errors": []
-        });
-        if code == "validation_failed" {
-            error["errors"] = json!([{"pointer":"#/segment_texts","parameter":null,"code":"required","detail":"A level is required."}]);
-        }
-        let stub = Stub::new(vec![response(status, error.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "setWorkspaceApiKeyDefaultStackPermissions",
-                "--path",
-                "apiKeyId=api_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--file",
-                "-",
-            ],
-            Some("{}"),
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        let actual: Value = serde_json::from_slice(&out.stderr).unwrap();
-        assert_eq!(actual["problem"], error);
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn workspace_permission_replacement_preserves_all_public_levels_and_conditions() {
-    let contract: Value = serde_json::from_str(include_str!("../contract/v2.json")).unwrap();
-    assert_eq!(
-        contract["components"]["schemas"]["SetApiKeyWorkspacePermissions"]["required"],
-        json!([
-            "ai_translation",
-            "api_access",
-            "billing_subscription",
-            "glossaries",
-            "labels",
-            "logs",
-            "members",
-            "plugins_integrations",
-            "stacks",
-            "style_guides",
-            "translation_memories",
-            "translation_orders",
-            "work_reports",
-            "workspaces"
-        ])
-    );
-    let operation = &contract["paths"]["/v2/api-keys/{apiKeyId}/workspace-permissions"]["put"];
-    assert!(operation["responses"]["200"]["headers"].get("ETag").is_none());
-    let id = "api_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let body = json!({"billing_subscription":"NO_ACCESS","workspaces":"NO_ACCESS","members":"NO_ACCESS","plugins_integrations":"VIEW","logs":"MANAGE","api_access":"MANAGE","stacks":"VIEW","translation_orders":"MANAGE","work_reports":"NO_ACCESS","style_guides":"VIEW","glossaries":"MANAGE","translation_memories":"NO_ACCESS","labels":"VIEW","ai_translation":"MANAGE"});
-    let mut workspace_permissions: Vec<Value> = [
-        "BILLING_SUBSCRIPTION",
-        "WORKSPACES",
-        "MEMBERS",
-        "PLUGINS_INTEGRATIONS",
-        "LOGS",
-        "API_ACCESS",
-        "STACKS",
-        "TRANSLATION_ORDERS",
-        "WORK_REPORTS",
-        "STYLE_GUIDES",
-        "GLOSSARIES",
-        "TRANSLATION_MEMORIES",
-        "LABELS",
-        "AI_TRANSLATION",
-    ]
-    .iter()
-    .map(|target| json!({"scope":"WORKSPACE","target":target,"level":body[target.to_lowercase()]}))
-    .collect();
-    workspace_permissions.push(json!({"scope":"WORKSPACE","target":"QUICK_TRANSLATIONS","level":"WRITE"}));
-    let permissions: Vec<Value> = [
-        "GENERAL",
-        "SETTINGS",
-        "ACTIVITIES",
-        "RESOURCES",
-        "CONTEXT_IMAGES",
-        "LANGUAGES",
-        "SEGMENT_KEYS",
-        "SEGMENTS",
-        "SEGMENT_TEXTS",
-    ]
-    .iter()
-    .map(|target| json!({"scope":"STACK","target":target,"level":"VIEW"}))
-    .collect();
-    let expected = json!({"object_type":"API_KEY_PERMISSION_CONFIGURATION","id":id,"management_mode":"WORKSPACE_MANAGED","workspace_permissions":workspace_permissions,"default_stack_permissions":permissions,"created_at":"2026-10-01T00:00:00.123Z","updated_at":"2026-10-01T01:00:00.456Z"});
-    let required = contract["components"]["schemas"]["ApiKeyPermissionConfiguration"]["required"]
-        .as_array()
-        .unwrap();
-    assert_eq!(expected.as_object().unwrap().len(), required.len());
-    for field in required {
-        assert!(expected.get(field.as_str().unwrap()).is_some());
-    }
-    for condition in [None, Some("*"), Some("\"override\"")] {
-        let stub = Stub::new(vec![response("200 OK", expected.clone(), "")]);
-        let path = format!("apiKeyId={id}");
-        let mut args = vec![
-            "--json",
-            "api",
-            "call",
-            "setWorkspaceApiKeyWorkspacePermissions",
-            "--path",
-            &path,
-            "--file",
-            "-",
-            "--include-headers",
-        ];
-        if let Some(value) = condition {
-            args.extend(["--if-match", value]);
-        }
-        let out = command(&stub.origin, &args, Some(&body.to_string()));
-        assert_eq!(success(&out), expected);
-        assert!(
-            !String::from_utf8_lossy(&out.stderr)
-                .to_lowercase()
-                .contains("etag:")
-        );
-        let requests = stub.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with(&format!("PUT /v2/api-keys/{id}/workspace-permissions ")));
-        let (headers, payload) = requests[0].split_once("\r\n\r\n").unwrap();
-        assert_eq!(serde_json::from_str::<Value>(payload).unwrap(), body);
-        match condition {
-            Some(value) => assert!(headers.to_lowercase().contains(&format!("if-match: {value}"))),
-            None => assert!(!headers.to_lowercase().contains("if-match:")),
-        }
-    }
-}
-
-#[test]
-fn workspace_permission_replacement_retains_errors_without_retrying() {
-    for (status, code) in [
-        ("401 Unauthorized", "disabled_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-        ("412 Precondition Failed", "precondition_failed"),
-        ("422 Unprocessable Content", "validation_failed"),
-    ] {
-        let mut error = json!({
-            "type": "about:blank",
-            "title": &status[4..],
-            "status": status[..3].parse::<u16>().unwrap(),
-            "detail": "The permission replacement could not be completed.",
-            "instance": "/v2/api-keys/api_0197c8f2-5a6b-7cde-8f12-3456789abcde/workspace-permissions",
-            "code": code,
-            "request_id": "override-permissions",
-            "errors": []
-        });
-        if code == "validation_failed" {
-            error["errors"] = json!([{"pointer":"#/api_access","parameter":null,"code":"required","detail":"A level is required."}]);
-        }
-        let stub = Stub::new(vec![response(status, error.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "setWorkspaceApiKeyWorkspacePermissions",
-                "--path",
-                "apiKeyId=api_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--file",
-                "-",
-            ],
-            Some("{}"),
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        let actual: Value = serde_json::from_slice(&out.stderr).unwrap();
-        assert_eq!(actual["problem"], error);
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn stack_permission_creation_forwards_complete_body_and_location() {
-    let contract: Value = serde_json::from_str(include_str!("../contract/v2.json")).unwrap();
-    let operation = &contract["paths"]["/v2/api-keys/{apiKeyId}/stack-permissions/{stackId}"]["put"];
-    assert!(operation["responses"]["201"]["headers"].get("Location").is_some());
-    // Creation is an upsert at a known key, so there is no idempotency key to forward.
+    let operation = bundled_operation(&contract, "updateProjectSettings");
     assert!(
-        operation["parameters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|parameter| parameter["name"] != "Idempotency-Key")
+        operation["requestBody"]["content"]
+            .get("application/merge-patch+json")
+            .is_some()
     );
-    let api = "api_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let stack = "stack_0197c8f2-5a6b-7cde-8f12-3456789abcdf";
-    let body = json!({"general":"VIEW","settings":"NO_ACCESS","activities":"MANAGE","resources":"VIEW","context_images":"MANAGE","languages":"NO_ACCESS","segment_keys":"VIEW","segments":"MANAGE","segment_texts":"NO_ACCESS"});
-    let permissions: Vec<_> = [
-        "GENERAL",
-        "SETTINGS",
-        "ACTIVITIES",
-        "RESOURCES",
-        "CONTEXT_IMAGES",
-        "LANGUAGES",
-        "SEGMENT_KEYS",
-        "SEGMENTS",
-        "SEGMENT_TEXTS",
-    ]
-    .iter()
-    .map(|target| json!({"scope":"STACK","target":target,"level":body[target.to_lowercase()]}))
-    .collect();
-    let expected = json!({"object_type":"API_KEY_STACK_PERMISSIONS","api_key_id":api,"stack_id":stack,"permissions":permissions,"created_at":"2026-10-01T00:00:00.123Z","updated_at":"2026-10-01T00:00:00.123Z"});
-    let fields = contract["components"]["schemas"]["ApiKeyStackPermissions"]["required"]
-        .as_array()
-        .unwrap();
-    assert_eq!(expected.as_object().unwrap().len(), fields.len());
-    for field in fields {
-        assert!(expected.get(field.as_str().unwrap()).is_some());
-    }
-    let location = format!("/v2/api-keys/{api}/stack-permissions/{stack}");
-    let stub = Stub::new(vec![response(
-        "201 Created",
-        expected.clone(),
-        &format!("Location: {location}\r\n"),
-    )]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "--include-headers",
-            "api",
-            "call",
-            "setWorkspaceApiKeyStackPermissions",
-            "--path",
-            &format!("apiKeyId={api}"),
-            "--path",
-            &format!("stackId={stack}"),
-            "--file",
-            "-",
-        ],
-        Some(&body.to_string()),
-    );
-    assert_eq!(success(&out), expected);
-    assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("location: {location}")));
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].starts_with(&format!("PUT {location} ")));
-    let (headers, payload) = requests[0].split_once("\r\n\r\n").unwrap();
-    assert_eq!(serde_json::from_str::<Value>(payload).unwrap(), body);
-    assert!(!headers.to_lowercase().contains("idempotency-key:"));
-    assert!(!headers.to_lowercase().contains("if-match:"));
-}
-
-#[test]
-fn placeholder_replacement_preserves_all_profiles_order_empty_and_condition() {
-    let contract: Value = serde_json::from_str(include_str!("../contract/v2.json")).unwrap();
     assert_eq!(
-        contract["components"]["schemas"]["SetProjectPlaceholderSettings"]["required"],
-        json!(["definitions"])
+        deref(&contract, &operation["responses"]["200"]["headers"]["ETag"])["schema"]["type"],
+        "string"
     );
-    let all = contract["components"]["schemas"]["PlaceholderDefinition"]["enum"].clone();
+    let all = schemas["PlaceholderDefinition"]["enum"].clone();
     assert_eq!(all.as_array().unwrap().len(), 28);
     let id = "pr_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    for definitions in [json!(["IOS_PRINTF", "DEFAULT_ICU", "IOS_PRINTF"]), json!([]), all] {
-        let body = json!({"definitions":definitions});
-        let expected = json!({"object_type":"PROJECT_PLACEHOLDER_SETTINGS","id":id,"definitions":definitions,"default_definitions":["DEFAULT_ICU"],"is_default":false,"created_at":"2026-10-01T00:00:00.123Z","updated_at":"2026-10-01T01:00:00.456Z"});
-        let fields = contract["components"]["schemas"]["ProjectPlaceholderSettings"]["required"]
-            .as_array()
-            .unwrap();
-        assert_eq!(expected.as_object().unwrap().len(), fields.len());
-        for field in fields {
-            assert!(expected.get(field.as_str().unwrap()).is_some());
-        }
-        for condition in [None, Some("*"), Some("\"profiles\"")] {
-            let stub = Stub::new(vec![response("200 OK", expected.clone(), "")]);
+    let expected = project_settings_document(id);
+    for body in [
+        json!({"placeholders":{"definitions":["IOS_PRINTF", "DEFAULT_ICU", "IOS_PRINTF"]}}),
+        json!({"placeholders":{"definitions":[]}}),
+        json!({"placeholders":{"definitions":all}}),
+        json!({"keys":{"normalization_strategy":"ALL"}}),
+        json!({"keys":{"normalization_strategy":"NONE"}}),
+        json!({"keys":{"normalization_strategy":"FORMAT_SPECIFIC"}}),
+        json!({"import":{"is_source_creation_enabled":false,"source_text_update_mode":"NEVER","is_source_metadata_update_enabled":false,"is_source_deactivation_enabled":false,"is_target_creation_enabled":true,"target_text_update_mode":"ALWAYS","is_target_metadata_update_enabled":true,"is_target_deactivation_enabled":true}}),
+        json!({"export":{"source_statuses":["APPROVED","NEW","APPROVED"],"target_statuses":[],"source_empty_content_handling":"SKIP","target_empty_content_handling":"KEEP","is_not_translatable_skipped":false,"html_encoding":"RAW"}}),
+        json!({"format":{"general":{"charset":"UTF_8","file_name_languages":"ALL","is_source_used_when_missing":false,"comment_languages":"SOURCE","indentation":0,"is_final_newline_enabled":true},"json":{"is_array_indentation_enabled":true,"is_plural_order_alphabetical":false},"xliff":null}}),
+        json!({"format":null,"integrations":{"is_removed_language_deletion_enabled":false}}),
+        json!({}),
+    ] {
+        for condition in [None, Some("*"), Some("\"settings\"")] {
+            let stub = Stub::new(vec![response(
+                "200 OK",
+                expected.clone(),
+                "ETag: \"patched\"\r\n",
+            )]);
             let path = format!("projectId={id}");
             let mut args = vec![
                 "--json",
                 "--include-headers",
                 "api",
                 "call",
-                "setProjectPlaceholderSettings",
+                "updateProjectSettings",
                 "--path",
                 &path,
                 "--file",
@@ -8149,14 +6440,10 @@ fn placeholder_replacement_preserves_all_profiles_order_empty_and_condition() {
             }
             let out = command(&stub.origin, &args, Some(&body.to_string()));
             assert_eq!(success(&out), expected);
-            assert!(
-                !String::from_utf8_lossy(&out.stderr)
-                    .to_lowercase()
-                    .contains("etag:")
-            );
+            assert!(String::from_utf8_lossy(&out.stderr).contains("etag: \"patched\""));
             let requests = stub.finish();
             assert_eq!(requests.len(), 1);
-            assert!(requests[0].starts_with(&format!("PUT /v2/projects/{id}/placeholder-settings ")));
+            assert!(requests[0].starts_with(&format!("PATCH /v2/projects/{id}/settings ")));
             let (headers, payload) = requests[0].split_once("\r\n\r\n").unwrap();
             assert_eq!(serde_json::from_str::<Value>(payload).unwrap(), body);
             match condition {
@@ -8168,7 +6455,7 @@ fn placeholder_replacement_preserves_all_profiles_order_empty_and_condition() {
 }
 
 #[test]
-fn placeholder_replacement_retains_errors_without_retrying() {
+fn project_settings_patch_retains_errors_without_retrying() {
     for (status, code) in [
         ("401 Unauthorized", "disabled_api_key"),
         ("403 Forbidden", "insufficient_permissions"),
@@ -8177,11 +6464,12 @@ fn placeholder_replacement_retains_errors_without_retrying() {
         ("422 Unprocessable Content", "validation_failed"),
     ] {
         let errors = if code == "validation_failed" {
-            json!([{"pointer":"#/definitions/0","parameter":null,"code":"required","detail":"A supported profile is required."}])
+            json!([{"pointer":"#/placeholders/definitions/0","parameter":null,"code":"required","detail":"A supported profile is required."},
+                {"pointer":"#/export/source_statuses/0","parameter":null,"code":"enum","detail":"Unknown status"}])
         } else {
             json!([])
         };
-        let error = json!({"type":"about:blank","title":&status[4..],"status":status[..3].parse::<u16>().unwrap(),"detail":"The profile replacement could not be completed.","instance":"/v2/projects/pr_0197c8f2-5a6b-7cde-8f12-3456789abcde/placeholder-settings","code":code,"request_id":"placeholder-replace","errors":errors});
+        let error = json!({"type":"about:blank","title":&status[4..],"status":status[..3].parse::<u16>().unwrap(),"detail":"The settings could not be changed.","instance":"/v2/projects/pr_0197c8f2-5a6b-7cde-8f12-3456789abcde/settings","code":code,"request_id":"settings-patch","errors":errors});
         let stub = Stub::new(vec![response(status, error.clone(), "")]);
         let out = command(
             &stub.origin,
@@ -8189,106 +6477,13 @@ fn placeholder_replacement_retains_errors_without_retrying() {
                 "--json",
                 "api",
                 "call",
-                "setProjectPlaceholderSettings",
+                "updateProjectSettings",
                 "--path",
                 "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
                 "--file",
                 "-",
             ],
-            Some("{}"),
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        let actual: Value = serde_json::from_slice(&out.stderr).unwrap();
-        assert_eq!(actual["problem"], error);
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn key_setting_replacement_preserves_strategy_and_condition() {
-    let contract: Value = serde_json::from_str(include_str!("../contract/v2.json")).unwrap();
-    assert_eq!(
-        contract["components"]["schemas"]["SetProjectKeySettings"]["required"],
-        json!(["normalization_strategy"])
-    );
-    let id = "pr_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    for definitions in [json!("ALL"), json!("NONE"), json!("FORMAT_SPECIFIC")] {
-        let body = json!({"normalization_strategy":definitions});
-        let expected = json!({"object_type":"PROJECT_KEY_SETTINGS","id":id,"normalization_strategy":definitions,"created_at":"2026-10-01T00:00:00.123Z","updated_at":"2026-10-01T01:00:00.456Z"});
-        let fields = contract["components"]["schemas"]["ProjectKeySettings"]["required"]
-            .as_array()
-            .unwrap();
-        assert_eq!(expected.as_object().unwrap().len(), fields.len());
-        for field in fields {
-            assert!(expected.get(field.as_str().unwrap()).is_some());
-        }
-        for condition in [None, Some("*"), Some("\"strategy\"")] {
-            let stub = Stub::new(vec![response("200 OK", expected.clone(), "")]);
-            let path = format!("projectId={id}");
-            let mut args = vec![
-                "--json",
-                "--include-headers",
-                "api",
-                "call",
-                "setProjectKeySettings",
-                "--path",
-                &path,
-                "--file",
-                "-",
-            ];
-            if let Some(value) = condition {
-                args.extend(["--if-match", value]);
-            }
-            let out = command(&stub.origin, &args, Some(&body.to_string()));
-            assert_eq!(success(&out), expected);
-            assert!(
-                !String::from_utf8_lossy(&out.stderr)
-                    .to_lowercase()
-                    .contains("etag:")
-            );
-            let requests = stub.finish();
-            assert_eq!(requests.len(), 1);
-            assert!(requests[0].starts_with(&format!("PUT /v2/projects/{id}/key-settings ")));
-            let (headers, payload) = requests[0].split_once("\r\n\r\n").unwrap();
-            assert_eq!(serde_json::from_str::<Value>(payload).unwrap(), body);
-            match condition {
-                Some(value) => assert!(headers.to_lowercase().contains(&format!("if-match: {value}"))),
-                None => assert!(!headers.to_lowercase().contains("if-match:")),
-            }
-        }
-    }
-}
-
-#[test]
-fn key_setting_replacement_retains_errors_without_retrying() {
-    for (status, code) in [
-        ("401 Unauthorized", "disabled_api_key"),
-        ("403 Forbidden", "insufficient_permissions"),
-        ("404 Not Found", "resource_not_found"),
-        ("412 Precondition Failed", "precondition_failed"),
-        ("422 Unprocessable Content", "validation_failed"),
-    ] {
-        let errors = if code == "validation_failed" {
-            json!([{"pointer":"#/normalization_strategy","parameter":null,"code":"required","detail":"A supported strategy is required."}])
-        } else {
-            json!([])
-        };
-        let error = json!({"type":"about:blank","title":&status[4..],"status":status[..3].parse::<u16>().unwrap(),"detail":"The key-strategy replacement could not be completed.","instance":"/v2/projects/pr_0197c8f2-5a6b-7cde-8f12-3456789abcde/key-settings","code":code,"request_id":"key-replace","errors":errors});
-        let stub = Stub::new(vec![response(status, error.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "call",
-                "setProjectKeySettings",
-                "--path",
-                "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--file",
-                "-",
-            ],
-            Some("{}"),
+            Some(r#"{"placeholders":{"definitions":[null]},"export":{"source_statuses":["FUTURE"]}}"#),
         );
         assert_eq!(out.status.code(), Some(1));
         assert!(out.stdout.is_empty());
@@ -8300,20 +6495,12 @@ fn key_setting_replacement_retains_errors_without_retrying() {
 
 #[test]
 fn import_history_preserves_cursor_queries_and_stored_values() {
-    for (operation, suffix, item) in [
-        (
-            "listImportResourceChanges",
-            "resource",
-            json!({"object_type":"IMPORT_RESOURCE_CHANGE","id":"rsl_0197c8f2-5a6b-7cde-8f12-3456789abcde","entry_id":"rie_0197c8f2-5a6b-7cde-8f12-3456789abcde","segment_id":null,"key_id":null,"type":"RENAMED","previous_path":"old/de.json","path":"de.json","previous_key":"old.key","key":"new.key","created_at":"2026-10-01T10:00:00.000Z","updated_at":"2026-10-01T10:00:00.000Z"}),
-        ),
-        (
-            "listImportTextChanges",
-            "text",
-            json!({"object_type":"IMPORT_TEXT_CHANGE","id":"sll_0197c8f2-5a6b-7cde-8f12-3456789abcde","entry_id":"rie_0197c8f2-5a6b-7cde-8f12-3456789abcde","segment_id":null,"text_id":null,"type":"CONTENT_CHANGED","language_code":"de","previous_status":"TRANSLATED","status":"TRANSLATED","variants":[{"position":1,"device":"OTHER","plural_form":"OTHER","previous_content":"Before <tag>","content":"After & value"}],"created_at":"2026-10-01T10:00:00.000Z","updated_at":"2026-10-01T10:00:00.000Z"}),
-        ),
+    for item in [
+        json!({"object_type":"IMPORT_CHANGE","entry_id":"rie_0197c8f2-5a6b-7cde-8f12-3456789abcde","segment_id":null,"key":{"change":"RENAMED","key_id":null,"previous_path":"old/de.json","path":"de.json","previous_key":"old.key","key":"new.key"},"texts":[],"created_at":"2026-10-01T10:00:00.000Z"}),
+        json!({"object_type":"IMPORT_CHANGE","entry_id":"rie_0197c8f2-5a6b-7cde-8f12-3456789abcde","segment_id":"seg_0197c8f2-5a6b-7cde-8f12-3456789abcde","key":null,"texts":[{"change":"CONTENT_CHANGED","language_code":"de","previous_status":"TRANSLATED","status":"TRANSLATED","variants":[{"position":1,"device":"OTHER","plural_form":"OTHER","previous_content":"Before <tag>","content":"After & value"}]}],"created_at":"2026-10-01T10:00:00.000Z"}),
     ] {
-        let field = format!("import_{suffix}_change[entry_id]");
-        let filter = json!({"where":{"_and":[{field:{"_eq":"rie_0197c8f2-5a6b-7cde-8f12-3456789abcde"}}]}})
+        let operation = "listImportChanges";
+        let filter = json!({"where":{"_and":[{"import_change[entry_id]":{"_eq":"rie_0197c8f2-5a6b-7cde-8f12-3456789abcde"}}]}})
             .to_string();
         let expected = page(json!([item]), Some("next-cursor+/="));
         let stub = Stub::new(vec![
@@ -8372,7 +6559,7 @@ fn import_history_preserves_cursor_queries_and_stored_values() {
             .unwrap();
             assert_eq!(
                 target.path(),
-                format!("/v2/imports/rin_0197c8f2-5a6b-7cde-8f12-3456789abcde/{suffix}-changes")
+                "/v2/imports/rin_0197c8f2-5a6b-7cde-8f12-3456789abcde/changes"
             );
             let query: std::collections::BTreeMap<_, _> = target.query_pairs().into_owned().collect();
             assert_eq!(query.get("filter"), Some(&filter));
@@ -8388,7 +6575,7 @@ fn import_history_preserves_cursor_queries_and_stored_values() {
 
 #[test]
 fn import_history_preserves_access_and_paging_problems_without_retry() {
-    for operation in ["listImportResourceChanges", "listImportTextChanges"] {
+    for operation in ["listImportChanges"] {
         for (status, code) in [
             ("401 Unauthorized", "missing_api_key"),
             ("403 Forbidden", "insufficient_permissions"),
@@ -8502,100 +6689,11 @@ fn invitation_assignment_preserves_scope_and_authentication_errors_without_retry
 }
 
 #[test]
-fn file_settings_replacement_preserves_complete_values_and_validator() {
-    let id = "pr_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    for (kind, operation, payload) in [
-        (
-            "import",
-            "setProjectImportSettings",
-            json!({"is_source_creation_enabled":false,"source_text_update_mode":"NEVER","is_source_metadata_update_enabled":false,"is_source_deactivation_enabled":false,"is_target_creation_enabled":true,"target_text_update_mode":"ALWAYS","is_target_metadata_update_enabled":true,"is_target_deactivation_enabled":true}),
-        ),
-        (
-            "export",
-            "setProjectExportSettings",
-            json!({"source_statuses":["APPROVED","NEW","APPROVED"],"target_statuses":[],"source_empty_content_handling":"SKIP","target_empty_content_handling":"KEEP","is_not_translatable_skipped":false,"html_encoding":"RAW"}),
-        ),
-    ] {
-        let expected = json!({"object_type":format!("PROJECT_{}_SETTINGS",kind.to_uppercase()),"id":id,"configuration":payload,"created_at":"2026-10-01T00:00:00.000Z","updated_at":"2026-10-01T10:00:00.000Z"});
-        let stub = Stub::new(vec![response("200 OK", expected.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "--include-headers",
-                "api",
-                "call",
-                operation,
-                "--path",
-                &format!("projectId={id}"),
-                "--if-match",
-                "\"current-defaults\"",
-                "--file",
-                "-",
-            ],
-            Some(&payload.to_string()),
-        );
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), expected);
-        let requests = stub.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with(&format!("PUT /v2/projects/{id}/{kind}-settings ")));
-        assert!(
-            requests[0]
-                .to_lowercase()
-                .contains("if-match: \"current-defaults\"")
-        );
-        assert_eq!(
-            serde_json::from_str::<Value>(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap(),
-            payload
-        );
-    }
-}
-
-#[test]
-fn file_settings_replacement_preserves_current_scope_stale_and_field_problems_without_retry() {
-    for operation in ["setProjectImportSettings", "setProjectExportSettings"] {
-        for (status, code) in [
-            ("401 Unauthorized", "disabled_api_key"),
-            ("403 Forbidden", "insufficient_permissions"),
-            ("404 Not Found", "resource_not_found"),
-            ("412 Precondition Failed", "precondition_failed"),
-            ("422 Unprocessable Entity", "validation_failed"),
-        ] {
-            let expected = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code,"request_id":"file-defaults","errors":[{"pointer":"#/source_statuses/0","code":"enum","detail":"Unknown status"}]});
-            let stub = Stub::new(vec![response(status, expected.clone(), "")]);
-            let out = command(
-                &stub.origin,
-                &[
-                    "--json",
-                    "api",
-                    "call",
-                    operation,
-                    "--path",
-                    "projectId=pr_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                    "--file",
-                    "-",
-                ],
-                Some("{}"),
-            );
-            assert_eq!(out.status.code(), Some(1));
-            assert!(out.stdout.is_empty());
-            assert_eq!(
-                serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-                expected
-            );
-            assert_eq!(stub.finish().len(), 1);
-        }
-    }
-}
-
-#[test]
 fn workspace_key_identity_filters_preserve_public_values_and_cursor_queries() {
-    for (field, prefix) in [("stack_id", "stack"), ("member_id", "wsu"), ("user_id", "usr")] {
+    for (field, prefix) in [("stack_id", "stack"), ("member_id", "wsu")] {
         let identity = format!("{prefix}_019b76da-a584-7000-8000-000000000001");
-        let filter =
-            json!({"where":{"_and":[{format!("workspace_api_key[{field}]"):{"_eq":identity}}]}}).to_string();
-        let first = json!({"object_type":"LIST","data":[{"object_type":"WORKSPACE_API_KEY","id":"api_019b76da-a584-7000-8000-000000000001",field:identity}],"has_more":true,"next_cursor":"opaque+/="});
+        let filter = json!({"where":{"_and":[{format!("api_key[{field}]"):{"_eq":identity}}]}}).to_string();
+        let first = json!({"object_type":"LIST","data":[{"object_type":"API_KEY","id":"api_019b76da-a584-7000-8000-000000000001",field:identity}],"has_more":true,"next_cursor":"opaque+/="});
         let last = json!({"object_type":"LIST","data":[],"has_more":false,"next_cursor":null});
         let stub = Stub::new(vec![
             response("200 OK", first.clone(), ""),
@@ -8676,7 +6774,7 @@ fn workspace_key_identity_filter_failures_preserve_problem_details_without_retry
                 "call",
                 "listWorkspaceApiKeys",
                 "--query",
-                "filter={\"where\":{\"_and\":[{\"workspace_api_key[user_id]\":{\"_eq\":\"usr_019b76da-a584-7000-8000-000000000001\"}}]}}",
+                "filter={\"where\":{\"_and\":[{\"api_key[member_id]\":{\"_eq\":\"wsu_019b76da-a584-7000-8000-000000000001\"}}]}}",
             ],
             None,
         );
@@ -8765,7 +6863,7 @@ fn mcp_catalog_is_offline_and_needs_no_credential_or_valid_origin() {
     let out = command("not a URL", &["--api-key", "", "api", "mcp-tools"], None);
     let catalog = success(&out);
     assert_eq!(catalog["selection"], "discovery");
-    assert_eq!(catalog["available_operation_count"], 309);
+    assert_eq!(catalog["available_operation_count"], 247);
     let tools = catalog["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 8);
     assert!(
@@ -8786,7 +6884,7 @@ fn mcp_catalog_filters_operations_without_dropping_conditional_schema() {
             "--operation",
             "getProject",
             "--operation",
-            "setProjectKeySettings",
+            "updateProjectSettings",
         ],
         None,
     );
@@ -8796,12 +6894,17 @@ fn mcp_catalog_filters_operations_without_dropping_conditional_schema() {
     assert_eq!(tools.len(), 2);
     let replacement = tools
         .iter()
-        .find(|tool| tool["_meta"]["lingohub/operationId"] == "setProjectKeySettings")
+        .find(|tool| tool["_meta"]["lingohub/operationId"] == "updateProjectSettings")
         .unwrap();
     assert_eq!(replacement["inputSchema"]["required"], json!(["path", "body"]));
     assert!(
         replacement["inputSchema"]["properties"]["headers"]["properties"]
             .get("If-Match")
+            .is_some()
+    );
+    assert!(
+        replacement["inputSchema"]["$defs"]["UpdateProjectKeySettings"]["properties"]
+            .get("normalization_strategy")
             .is_some()
     );
     let tag = replacement["_meta"]["lingohub/tag"].as_str().unwrap();
@@ -8816,30 +6919,6 @@ fn mcp_catalog_filters_operations_without_dropping_conditional_schema() {
 }
 
 #[test]
-fn mcp_permission_inputs_exclude_session_only_write_level() {
-    let operations = [
-        "setWorkspaceApiKeyWorkspacePermissions",
-        "setWorkspaceApiKeyDefaultStackPermissions",
-        "setWorkspaceApiKeyStackPermissions",
-    ];
-    let mut args = vec!["api", "mcp-tools"];
-    for operation in operations {
-        args.extend(["--operation", operation]);
-    }
-    let catalog = success(&command("not a URL", &args, None));
-    let tools = catalog["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), operations.len());
-    for tool in tools {
-        let definitions = &tool["inputSchema"]["$defs"];
-        assert_eq!(
-            definitions["ApiKeyPermissionLevel"]["enum"],
-            json!(["NO_ACCESS", "VIEW", "MANAGE"])
-        );
-        assert!(definitions.get("PermissionLevel").is_none());
-    }
-}
-
-#[test]
 fn large_escaped_key_round_trips_through_stdin_without_truncation() {
     let key = format!("\"{}\"", "\\\\".repeat(50000));
     let body = json!({"key":key,"group_key":null});
@@ -8850,7 +6929,7 @@ fn large_escaped_key_round_trips_through_stdin_without_truncation() {
             "--json",
             "api",
             "call",
-            "renameKey",
+            "updateKey",
             "--path",
             "keyId=ress_0197c8f2-5a6b-7cde-8f12-3456789abcde",
             "--file",
@@ -8870,7 +6949,8 @@ fn mcp_catalog_accounts_for_all_operations_and_reports_upload_adapters() {
     let catalog = success(&command("not a URL", &["api", "mcp-tools", "--all"], None));
     let tools = catalog["tools"].as_array().unwrap();
     let unsupported = catalog["unsupported"].as_array().unwrap();
-    assert_eq!(tools.len() + unsupported.len(), 309);
+    assert_eq!(tools.len() + unsupported.len(), 247);
+    assert_eq!(unsupported.len(), 2);
     assert!(unsupported.iter().any(|op| op["operation_id"] == "createImport"));
     assert!(
         tools
@@ -8897,7 +6977,7 @@ fn mcp_catalog_rejects_unknown_and_conflicting_selectors_before_io() {
 #[test]
 fn language_removal_forwards_optional_cleanup_choice_and_condition() {
     let branch = "prb_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let contract: Value = serde_json::from_str(include_str!("../contract/v2.json")).unwrap();
+    let contract = bundled_contract();
     let parameter =
         contract["paths"]["/v2/branches/{branchId}/languages/{languageCode}"]["delete"]["parameters"]
             .as_array()
@@ -8906,7 +6986,8 @@ fn language_removal_forwards_optional_cleanup_choice_and_condition() {
             .find(|p| p["name"] == "delete_unused_stack_language")
             .unwrap();
     assert_eq!(parameter["schema"]["type"], "boolean");
-    assert_eq!(parameter["schema"]["default"], true);
+    // Omitting the choice keeps the stack language and its translations.
+    assert_eq!(parameter["schema"]["default"], false);
     assert_eq!(parameter["required"], false);
     for choice in [None, Some("true"), Some("false")] {
         let stub = Stub::new(vec![
@@ -9094,83 +7175,19 @@ fn direct_sync_entry_reads_preserve_current_access_errors_without_retry() {
 }
 
 #[test]
-fn import_inspection_preserves_multipart_and_advisory_results() {
-    let file = UploadFixture::new("en.json", br#"{"hello":"World"}"#);
-    let branch = "prb_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let body = json!({"object_type":"IMPORT_INSPECTION","branch_id":branch,"has_mixed_upload_types":false,
-        "files":[{"path":"en.json","file_size_bytes":17,"upload_type":"PROJECT","is_extension_valid":true,
-        "is_size_valid":true,"suggestions":{"action":"CREATE","suggested_paths":[],"language_codes":["en"]}}]});
-    let stub = Stub::new(vec![response("200 OK", body.clone(), "ETag: \"inspection\"\r\n")]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "upload",
-            "inspectImportFiles",
-            "--path",
-            &format!("branchId={branch}"),
-            "--upload",
-            file.path(),
-            "--include-headers",
-        ],
-        None,
-    );
-    assert_eq!(success(&out), body);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("inspection"));
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].starts_with(&format!("POST /v2/branches/{branch}/imports/inspect ")));
-    assert!(requests[0].contains("name=\"file\"; filename=\"en.json\""));
-    assert!(requests[0].contains("{\"hello\":\"World\"}"));
-    assert!(!requests[0].contains("idempotency-key:"));
-}
-
-#[test]
-fn import_inspection_preserves_problems_without_retry() {
-    for (status, code) in [
-        ("403 Forbidden", "insufficient_permissions"),
-        ("409 Conflict", "branch_not_ready"),
-        ("422 Unprocessable Entity", "validation_failed"),
-    ] {
-        let file = UploadFixture::new("en.json", b"{}");
-        let expected = json!({"status":status[..3].parse::<u16>().unwrap(),"code":code});
-        let stub = Stub::new(vec![response(status, expected.clone(), "")]);
-        let out = command(
-            &stub.origin,
-            &[
-                "--json",
-                "api",
-                "upload",
-                "inspectImportFiles",
-                "--path",
-                "branchId=prb_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-                "--upload",
-                file.path(),
-            ],
-            None,
-        );
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&out.stderr).unwrap()["problem"],
-            expected
-        );
-        assert_eq!(stub.finish().len(), 1);
-    }
-}
-
-#[test]
-fn git_push_settings_read_and_replace_preserve_complete_value_and_condition() {
-    let value = json!({
+fn git_push_settings_read_and_patch_preserve_complete_value_and_condition() {
+    let push = json!({
         "push_type":"PULL_REQUEST", "auto_push_default_branch_type":"PULL_REQUEST",
         "auto_push_other_branches_type":"NONE", "commit_message":"Translate {project}",
         "commit_description":"", "pull_request_branch":"translations/{base_branch}",
         "pull_request_title":"Update — Grüße", "pull_request_description":""
     });
+    let value =
+        json!({"object_type":"PROJECT_GIT_INTEGRATION","id":"pr_123","git_branch":"main","push":push});
+    let patch = json!({"push":push});
     let stub = Stub::new(vec![
         response("200 OK", value.clone(), "ETag: \"current\"\r\n"),
-        response("200 OK", value.clone(), ""),
+        response("200 OK", value.clone(), "ETag: \"patched\"\r\n"),
     ]);
     let read = command(
         &stub.origin,
@@ -9178,21 +7195,23 @@ fn git_push_settings_read_and_replace_preserve_complete_value_and_condition() {
             "--json",
             "api",
             "call",
-            "getProjectGitPushSettings",
+            "getProjectGitIntegration",
             "--path",
             "projectId=pr_123",
             "--include-headers",
         ],
         None,
     );
-    assert!(read.status.success(), "{}", String::from_utf8_lossy(&read.stderr));
+    assert_eq!(success(&read), value);
+    assert!(String::from_utf8_lossy(&read.stderr).contains("etag: \"current\""));
     let write = command(
         &stub.origin,
         &[
             "--json",
+            "--include-headers",
             "api",
             "call",
-            "setProjectGitPushSettings",
+            "updateProjectGitIntegration",
             "--file",
             "-",
             "--path",
@@ -9200,21 +7219,17 @@ fn git_push_settings_read_and_replace_preserve_complete_value_and_condition() {
             "--if-match",
             "\"current\"",
         ],
-        Some(&value.to_string()),
+        Some(&patch.to_string()),
     );
-    assert!(
-        write.status.success(),
-        "{}",
-        String::from_utf8_lossy(&write.stderr)
-    );
-    assert_eq!(serde_json::from_slice::<Value>(&write.stdout).unwrap(), value);
+    assert_eq!(success(&write), value);
+    assert!(String::from_utf8_lossy(&write.stderr).contains("etag: \"patched\""));
     let requests = stub.finish();
     assert_eq!(requests.len(), 2);
-    assert!(requests[0].starts_with("GET /v2/projects/pr_123/integrations/git/push-settings "));
-    assert!(requests[1].starts_with("PUT /v2/projects/pr_123/integrations/git/push-settings "));
+    assert!(requests[0].starts_with("GET /v2/projects/pr_123/integrations/git "));
+    assert!(requests[1].starts_with("PATCH /v2/projects/pr_123/integrations/git "));
     let (headers, body) = requests[1].split_once("\r\n\r\n").unwrap();
     assert!(headers.to_lowercase().contains("if-match: \"current\""));
-    assert_eq!(serde_json::from_str::<Value>(body).unwrap(), value);
+    assert_eq!(serde_json::from_str::<Value>(body).unwrap(), patch);
 }
 
 #[test]
@@ -9223,7 +7238,7 @@ fn git_push_settings_preserve_validation_and_stale_problems_without_retry() {
         (
             "422 Unprocessable Entity",
             "validation_failed",
-            json!([{"code":"required","pointer":"#/commit_message","detail":"is required"}]),
+            json!([{"code":"required","pointer":"#/push/commit_message","detail":"is required"}]),
         ),
         ("412 Precondition Failed", "precondition_failed", json!([])),
         ("403 Forbidden", "insufficient_permissions", json!([])),
@@ -9237,7 +7252,7 @@ fn git_push_settings_preserve_validation_and_stale_problems_without_retry() {
                 "--json",
                 "api",
                 "call",
-                "setProjectGitPushSettings",
+                "updateProjectGitIntegration",
                 "--file",
                 "-",
                 "--path",
@@ -9245,7 +7260,7 @@ fn git_push_settings_preserve_validation_and_stale_problems_without_retry() {
                 "--if-match",
                 "\"old\"",
             ],
-            Some("{}"),
+            Some(r#"{"push":{"commit_message":""}}"#),
         );
         assert_eq!(out.status.code(), Some(1));
         assert!(out.stdout.is_empty());
@@ -9291,115 +7306,6 @@ fn csv_structure_failure_preserves_terminal_parent_and_entry_reason() {
     assert_eq!(requests.len(), 2);
     assert!(requests[0].starts_with("GET /v2/exports/reg_123 "));
     assert!(requests[1].starts_with("GET /v2/exports/reg_123/entries "));
-}
-
-#[test]
-fn import_cancellation_sends_no_body_and_preserves_validator_and_replay_key() {
-    let id = "rin_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let metadata = json!({"object_type":"IMPORT","id":id,"branch_id":"prb_0197c8f2-5a6b-7cde-8f12-3456789abcde","type":"UPLOAD","status":"CANCELLED","status_details":null,"git_source":null,"segments_created":null,"segments_reactivated":null,"segments_deactivated":null,"segments_renamed":null,"segment_texts_updated":null,"created_at":"2026-10-02T10:00:00.000Z","updated_at":"2026-10-02T10:00:01.000Z"});
-    let stub = Stub::new(vec![response(
-        "200 OK",
-        metadata.clone(),
-        "ETag: \"cancelled\"\r\nIdempotent-Replayed: true\r\n",
-    )]);
-    let path = format!("importId={id}");
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "--include-headers",
-            "api",
-            "call",
-            "cancelImport",
-            "--path",
-            &path,
-            "--if-match",
-            "\"queued\"",
-            "--idempotency-key",
-            "cancel-once",
-        ],
-        None,
-    );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), metadata);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("etag: \"cancelled\""));
-    assert!(stderr.contains("idempotent-replayed: true"));
-    let requests = stub.finish();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].starts_with(&format!("POST /v2/imports/{id}/cancel HTTP/1.1")));
-    let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
-    assert!(body.is_empty());
-    let headers = headers.to_lowercase();
-    assert!(headers.contains("if-match: \"queued\""));
-    assert!(headers.contains("idempotency-key: cancel-once"));
-}
-
-#[test]
-fn import_cancellation_preserves_claim_conflict_without_retrying() {
-    let problem = json!({"type":"https://api.lingohub.com/problems/import_not_cancellable","title":"Import cannot be cancelled","status":409,"detail":"Worker has already claimed the import.","code":"import_not_cancellable","request_id":"test-cancel"});
-    let stub = Stub::new(vec![response("409 Conflict", problem.clone(), "")]);
-    let out = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "cancelImport",
-            "--path",
-            "importId=rin_0197c8f2-5a6b-7cde-8f12-3456789abcde",
-        ],
-        None,
-    );
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("import_not_cancellable"));
-    assert_eq!(stub.finish().len(), 1);
-}
-
-#[test]
-fn csv_rows_use_resource_listing_and_flat_row_identity() {
-    let resource = "rc_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let row = "sgg_0197c8f2-5a6b-7cde-8f12-3456789abcde";
-    let metadata = json!({"object_type":"CSV_ROW","id":row,"resource_id":resource,"position":2,"key":"row_2","cells":[{"object_type":"CSV_CELL","resource_segment_id":"ress_0197c8f2-5a6b-7cde-8f12-3456789abcde","segment_id":"seg_0197c8f2-5a6b-7cde-8f12-3456789abcde","position":1,"key":"cell_A2"}],"created_at":"2026-10-02T11:00:00.000Z","updated_at":"2026-10-02T11:00:00.000Z"});
-    let page = json!({"object_type":"LIST","has_more":false,"next_cursor":null,"data":[metadata.clone()]});
-    let stub = Stub::new(vec![
-        response("200 OK", page.clone(), ""),
-        response("200 OK", metadata.clone(), ""),
-    ]);
-    let listed = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "listCsvRows",
-            "--path",
-            &format!("resourceId={resource}"),
-            "--query",
-            "limit=1",
-            "--query",
-            "cursor=opaque",
-        ],
-        None,
-    );
-    assert_eq!(success(&listed), page);
-    let retrieved = command(
-        &stub.origin,
-        &[
-            "--json",
-            "api",
-            "call",
-            "getCsvRow",
-            "--path",
-            &format!("csvRowId={row}"),
-        ],
-        None,
-    );
-    assert_eq!(success(&retrieved), metadata);
-    let requests = stub.finish();
-    assert!(requests[0].starts_with(&format!("GET /v2/resources/{resource}/csv-rows?")));
-    assert!(requests[0].contains("limit=1") && requests[0].contains("cursor=opaque"));
-    assert!(requests[1].starts_with(&format!("GET /v2/csv-rows/{row} ")));
 }
 
 #[test]
@@ -9524,12 +7430,12 @@ fn invitation_creation_preserves_metadata_location_replay_key_and_actionable_sco
 
 #[test]
 fn standalone_translation_keeps_partial_results_and_fails_without_retrying() {
-    let input = json!({"source_language_code":"en","target_language_code":"de","texts":[{"key":"a","text":"Hello"},{"key":"b","text":"World"}]});
+    let input = json!({"source_language_code":"en","target_language_code":"de","texts":["Hello","World"]});
     for succeeded in [0, 1, 2] {
-        let body = json!({"object_type":"LINA_TRANSLATE_RESULT","id":"lina_example","status":if succeeded == 2 {"SUCCEEDED"} else if succeeded == 1 {"PARTIALLY_SUCCEEDED"} else {"FAILED"},
+        let body = json!({"object_type":"LINA_TRANSLATE_RESULT","lina_id":"lina_example","source_language_code":"en","target_language_code":"de","status":if succeeded == 2 {"SUCCEEDED"} else if succeeded == 1 {"PARTIALLY_SUCCEEDED"} else {"FAILED"},
             "failure":if succeeded == 2 {Value::Null} else {json!("EXECUTION_FAILED")},
-            "results":[{"key":"a","is_translated":succeeded > 0,"text":if succeeded > 0 {json!("Hallo")} else {Value::Null}},
-                {"key":"b","is_translated":succeeded > 1,"text":if succeeded > 1 {json!("Welt")} else {Value::Null}}]});
+            "results":[{"is_reused":false,"linguistic_engine_id":null,"is_translated":succeeded > 0,"text":if succeeded > 0 {json!("Hallo")} else {Value::Null}},
+                {"is_reused":false,"linguistic_engine_id":null,"is_translated":succeeded > 1,"text":if succeeded > 1 {json!("Welt")} else {Value::Null}}]});
         let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
         let out = command(
             &stub.origin,
@@ -9559,15 +7465,16 @@ fn standalone_translation_keeps_partial_results_and_fails_without_retrying() {
 
 #[test]
 fn standalone_translation_rejects_missing_mismatched_or_inconsistent_outcomes() {
-    let input =
-        json!({"source_language_code":"en","target_language_code":"de","texts":[{"key":"a","text":"Hello"}]});
+    let input = json!({"source_language_code":"en","target_language_code":"de","texts":["Hello"]});
     for body in [
         json!({"object_type":"LINA_TRANSLATE_RESULT","status":"SUCCEEDED","failure":null,"results":[]}),
-        json!({"object_type":"LINA_TRANSLATE_RESULT","status":"SUCCEEDED","failure":null,"results":[{"key":"wrong","is_translated":true,"text":"Hallo"}]}),
-        json!({"object_type":"LINA_TRANSLATE_RESULT","status":"SUCCEEDED","failure":null,"results":[{"key":"a","is_translated":false,"text":null}]}),
-        json!({"object_type":"LINA_TRANSLATE_RESULT","status":"SUCCEEDED","failure":null,"results":[{"key":"a","is_translated":true,"text":null}]}),
-        json!({"object_type":"LINA_TRANSLATION","status":"SUCCEEDED","failure":null,"results":[{"key":"a","is_translated":true,"text":"Hallo"}]}),
-        json!({"object_type":"FUTURE_RESULT","status":"SUCCEEDED","results":[{"key":"a","is_translated":true,"text":"Hallo"}]}),
+        json!({"object_type":"LINA_TRANSLATE_RESULT","status":"SUCCEEDED","failure":null,"results":[{"is_translated":true,"text":"Hallo"},{"is_translated":true,"text":"Welt"}]}),
+        json!({"object_type":"LINA_TRANSLATE_RESULT","status":"SUCCEEDED","failure":null,"results":[{"is_translated":false,"text":null}]}),
+        json!({"object_type":"LINA_TRANSLATE_RESULT","status":"SUCCEEDED","failure":null,"results":[{"is_translated":true,"text":null}]}),
+        json!({"object_type":"LINA_TRANSLATE_RESULT","status":"FAILED","failure":null,"results":[{"is_translated":false,"text":null}]}),
+        json!({"object_type":"LINA_TRANSLATE_RESULT","status":"SUCCEEDED","failure":null,"results":[{"is_translated":"yes","text":"Hallo"}]}),
+        json!({"object_type":"LINA_TRANSLATION","status":"SUCCEEDED","failure":null,"results":[{"is_translated":true,"text":"Hallo"}]}),
+        json!({"object_type":"FUTURE_RESULT","status":"SUCCEEDED","results":[{"is_translated":true,"text":"Hallo"}]}),
     ] {
         let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
         let out = command(
@@ -9601,7 +7508,7 @@ fn lina_execution_polling_preserves_failed_run_and_never_retries_translation() {
     let out = waiting(
         &stub.origin,
         "getLinaExecution",
-        "executionId=tp_example",
+        "linaExecutionId=tp_example",
         &["--interval", "1"],
     );
     assert_eq!(out.status.code(), Some(1));
@@ -9617,25 +7524,12 @@ fn lina_execution_polling_preserves_failed_run_and_never_retries_translation() {
 
 #[test]
 fn git_configuration_commands_preserve_conditions_jobs_and_provider_errors() {
-    for (operation, suffix, input, output) in [
-        (
-            "setProjectGitSyncSettings",
-            "sync-settings",
-            json!({"import_mode":"PERIODIC", "import_schedule":{"period":"DAILY","time":"02:15"},"export_mode":"NONE"}),
-            json!({"object_type":"PROJECT_GIT_SYNC_SETTINGS","import_mode":"PERIODIC"}),
-        ),
-        (
-            "setProjectGitSelectionSettings",
-            "selection-settings",
-            json!({"is_branching":false,"path_filters":[],"branch_filters":[]}),
-            json!({"object_type":"GIT_SELECTION_UPDATE","configuration":{"is_branching":false},"scheduled_imports":[{"id":"ri_job","status":"QUEUED"}]}),
-        ),
-        (
-            "setProjectGitConnection",
-            "connection",
-            json!({"git_authentication_id":"iau_id","repository_url":"https://github.com/lingohub/example","git_branch":"main"}),
-            json!({"object_type":"PROJECT_GIT_INTEGRATION","git_authentication_id":"iau_id"}),
-        ),
+    let output = json!({"object_type":"PROJECT_GIT_INTEGRATION","id":"pr_id","git_authentication_id":"iau_id","git_branch":"main",
+        "sync":{"import_mode":"PERIODIC"},"selection":{"is_branching":false,"path_filters":[],"branch_filters":[]}});
+    for input in [
+        json!({"sync":{"import_mode":"PERIODIC","import_schedule":{"period":"DAILY","time":"02:15"},"export_mode":"NONE","export_schedule":null}}),
+        json!({"selection":{"is_branching":false,"path_filters":[],"branch_filters":[]}}),
+        json!({"git_authentication_id":"iau_id","namespace":"lingohub","name":"example","git_branch":"main"}),
     ] {
         let stub = Stub::new(vec![response("200 OK", output.clone(), "")]);
         let result = command(
@@ -9644,7 +7538,7 @@ fn git_configuration_commands_preserve_conditions_jobs_and_provider_errors() {
                 "--json",
                 "api",
                 "call",
-                operation,
+                "updateProjectGitIntegration",
                 "--path",
                 "projectId=pr_id",
                 "--if-match",
@@ -9657,7 +7551,7 @@ fn git_configuration_commands_preserve_conditions_jobs_and_provider_errors() {
         assert_eq!(success(&result), output);
         let requests = stub.finish();
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with(&format!("PUT /v2/projects/pr_id/integrations/git/{suffix} ")));
+        assert!(requests[0].starts_with("PATCH /v2/projects/pr_id/integrations/git "));
         let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
         assert!(headers.to_lowercase().contains("if-match: \"current\""));
         assert_eq!(serde_json::from_str::<Value>(body).unwrap(), input);
@@ -9675,13 +7569,13 @@ fn git_configuration_commands_preserve_conditions_jobs_and_provider_errors() {
                 "--json",
                 "api",
                 "call",
-                "setProjectGitSelectionSettings",
+                "updateProjectGitIntegration",
                 "--path",
                 "projectId=pr_id",
                 "--file",
                 "-",
             ],
-            Some("{}"),
+            Some(r#"{"selection":{"is_branching":true}}"#),
         );
         assert_eq!(result.status.code(), Some(1));
         assert_eq!(
@@ -9904,16 +7798,16 @@ fn mcp_stdio_preserves_mutation_condition_and_problem_without_retry() {
         problem.clone(),
         "X-Request-Id: mcp-write\r\n",
     )]);
-    let mut mcp = McpProcess::new(&stub.origin, &["--operation", "setProjectGitSyncSettings"]);
+    let mut mcp = McpProcess::new(&stub.origin, &["--operation", "updateProjectGitIntegration"]);
     let catalog = mcp.call("tools/list", json!({}));
     let name = catalog["result"]["tools"][0]["name"].as_str().unwrap();
-    let input = json!({"import_mode":"NONE","export_mode":"NONE"});
+    let input = json!({"sync":{"import_mode":"NONE","export_mode":"NONE"}});
     let result = mcp.call("tools/call", json!({"name":name,"arguments":{"path":{"projectId":"pr_id"},"body":input,"headers":{"If-Match":"\"stale\""}}}));
     assert_eq!(result["result"]["isError"], true);
     assert_eq!(result["result"]["structuredContent"]["problem"], problem);
     let requests = stub.finish();
     assert_eq!(requests.len(), 1);
-    assert!(requests[0].starts_with("PUT /v2/projects/pr_id/integrations/git/sync-settings "));
+    assert!(requests[0].starts_with("PATCH /v2/projects/pr_id/integrations/git "));
     assert!(requests[0].to_lowercase().contains("if-match: \"stale\""));
     let payload = requests[0].split_once("\r\n\r\n").unwrap().1;
     assert_eq!(serde_json::from_str::<Value>(payload).unwrap(), input);
@@ -9921,12 +7815,12 @@ fn mcp_stdio_preserves_mutation_condition_and_problem_without_retry() {
 
 #[test]
 fn mcp_stdio_retains_partial_translation_results_and_marks_them_incomplete() {
-    let body = json!({"object_type":"LINA_TRANSLATE_RESULT","status":"PARTIALLY_SUCCEEDED","failure":"PROVIDER_ERROR", "results":[{"key":"one","text":"Hallo","is_translated":true},{"key":"two","text":null,"is_translated":false}]});
+    let body = json!({"object_type":"LINA_TRANSLATE_RESULT","status":"PARTIALLY_SUCCEEDED","failure":"PROVIDER_UNAVAILABLE", "results":[{"text":"Hallo","is_translated":true},{"text":null,"is_translated":false}]});
     let stub = Stub::new(vec![response("200 OK", body.clone(), "")]);
     let mut mcp = McpProcess::new(&stub.origin, &["--operation", "translateLina"]);
     let catalog = mcp.call("tools/list", json!({}));
     let name = catalog["result"]["tools"][0]["name"].as_str().unwrap();
-    let result = mcp.call("tools/call", json!({"name":name,"arguments":{"path":{"linaId":"lina_id"},"body":{"source_language_code":"en","target_language_code":"de","texts":[{"key":"one","text":"Hello"},{"key":"two","text":"World"}]}}}));
+    let result = mcp.call("tools/call", json!({"name":name,"arguments":{"path":{"linaId":"lina_id"},"body":{"source_language_code":"en","target_language_code":"de","texts":["Hello","World"]}}}));
     assert_eq!(result["result"]["isError"], true, "{result}");
     assert_eq!(result["result"]["structuredContent"]["body"], body);
     assert_eq!(
@@ -9934,6 +7828,159 @@ fn mcp_stdio_retains_partial_translation_results_and_marks_them_incomplete() {
         "translation_incomplete"
     );
     assert_eq!(stub.finish().len(), 1);
+}
+
+#[test]
+fn mcp_stdio_sends_array_query_parameters_as_one_comma_separated_value() {
+    for (operation, path, target) in [
+        (
+            "getSegment",
+            json!({"segmentId":"seg_id"}),
+            "GET /v2/segments/seg_id?",
+        ),
+        (
+            "listSegments",
+            json!({"branchId":"prb_id"}),
+            "GET /v2/branches/prb_id/segments?",
+        ),
+    ] {
+        let stub = Stub::new(vec![response("200 OK", json!({"object_type":"SEGMENT"}), "")]);
+        let mut mcp = McpProcess::new(&stub.origin, &["--operation", operation]);
+        let catalog = mcp.call("tools/list", json!({}));
+        let tool = &catalog["result"]["tools"][0];
+        assert_eq!(
+            tool["inputSchema"]["properties"]["query"]["properties"]["language_codes"]["type"],
+            "array"
+        );
+        let name = tool["name"].as_str().unwrap();
+        let result = mcp.call(
+            "tools/call",
+            json!({"name":name,"arguments":{"path":path,"query":{"language_codes":["de","fr-CA"]}}}),
+        );
+        assert_eq!(result["result"]["isError"], false, "{result}");
+        let requests = stub.finish();
+        assert_eq!(requests.len(), 1);
+        let line = requests[0].lines().next().unwrap().replace("%2C", ",");
+        assert!(line.starts_with(target), "{line}");
+        assert!(line.contains("language_codes=de,fr-CA "), "{line}");
+    }
+}
+
+#[test]
+fn mcp_stdio_keeps_json_query_content_encoded_and_refuses_commas_inside_list_items() {
+    let stub = Stub::new(vec![response(
+        "200 OK",
+        json!({"object_type":"LIST","data":[],"has_more":false}),
+        "",
+    )]);
+    let mut mcp = McpProcess::new(&stub.origin, &["--operation", "listSegments"]);
+    let catalog = mcp.call("tools/list", json!({}));
+    let name = catalog["result"]["tools"][0]["name"].as_str().unwrap();
+    let refused = mcp.call(
+        "tools/call",
+        json!({"name":name,"arguments":{"path":{"branchId":"prb_id"},"query":{"language_codes":["de,fr"]}}}),
+    );
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert!(
+        refused["result"]["structuredContent"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("query.language_codes must list plain values without commas"),
+        "{refused}"
+    );
+    let filter = json!({"where":{"_and":[{"segment[label_ids]":{"_in":["lab_1","lab_2"]}}]}});
+    let result = mcp.call(
+        "tools/call",
+        json!({"name":name,"arguments":{"path":{"branchId":"prb_id"},"query":{"filter":filter,"limit":2}}}),
+    );
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    let requests = stub.finish();
+    assert_eq!(requests.len(), 1, "the refused call must not reach the API");
+    let line = requests[0].lines().next().unwrap();
+    let target = line.split(' ').nth(1).unwrap();
+    let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+    let value = |name: &str| {
+        url.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+    };
+    assert_eq!(value("limit").as_deref(), Some("2"), "{line}");
+    let sent = &value("filter").unwrap();
+    assert_eq!(serde_json::from_str::<Value>(sent).unwrap(), filter);
+}
+
+#[test]
+fn mcp_stdio_reports_batch_outcomes_and_keeps_the_body_of_a_malformed_one() {
+    let keys = json!({"items":[{"key":"a"},{"key":"b"}]});
+    let segments = json!({"items":[{"segment_id":"seg_1"},{"segment_id":"seg_2"}]});
+    let key = |id: &str| json!({"object_type":"KEY","id":id});
+    let segment = |id: &str| json!({"object_type":"SEGMENT","id":id});
+    for (operation, path, input, status, data, malformed) in [
+        (
+            "createKeysBulk",
+            json!({"resourceId":"rc_id"}),
+            keys.clone(),
+            "201 Created",
+            vec![key("key_1"), key("key_2")],
+            false,
+        ),
+        (
+            "createKeysBulk",
+            json!({"resourceId":"rc_id"}),
+            keys.clone(),
+            "201 Created",
+            vec![key("key_1")],
+            true,
+        ),
+        (
+            "updateSegmentsBulk",
+            json!({"branchId":"prb_id"}),
+            segments.clone(),
+            "200 OK",
+            vec![segment("seg_1"), segment("seg_2")],
+            false,
+        ),
+        (
+            "updateSegmentsBulk",
+            json!({"branchId":"prb_id"}),
+            segments.clone(),
+            "200 OK",
+            vec![segment("seg_2"), segment("seg_1")],
+            true,
+        ),
+        (
+            "transitionSegmentsBulk",
+            json!({"branchId":"prb_id"}),
+            segments.clone(),
+            "200 OK",
+            vec![segment("seg_1"), key("seg_2")],
+            true,
+        ),
+    ] {
+        let body = json!({"object_type":"LIST","data":data});
+        let stub = Stub::new(vec![response(status, body.clone(), "")]);
+        let mut mcp = McpProcess::new(&stub.origin, &["--operation", operation]);
+        let catalog = mcp.call("tools/list", json!({}));
+        let name = catalog["result"]["tools"][0]["name"].as_str().unwrap();
+        let result = mcp.call("tools/call", json!({"name":name,"arguments":{"path":path,"body":input,"headers":{"Idempotency-Key":"batch-1"}}}));
+        let content = &result["result"]["structuredContent"];
+        assert_eq!(result["result"]["isError"], malformed, "{operation}: {result}");
+        assert_eq!(content["body"], body, "{operation}");
+        if malformed {
+            assert!(
+                content["outcome_error"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Malformed bulk result"),
+                "{operation}: {result}"
+            );
+        } else {
+            assert!(content.get("outcome_error").is_none(), "{operation}: {result}");
+        }
+        let requests = stub.finish();
+        assert_eq!(requests.len(), 1, "{operation} must not be retried");
+        assert!(requests[0].to_lowercase().contains("idempotency-key: batch-1"));
+    }
 }
 
 #[test]
@@ -9958,7 +8005,7 @@ fn mcp_stdio_pages_the_selected_catalog_and_rejects_unknown_argument_groups() {
             break;
         }
     }
-    assert_eq!(names.len(), 306);
+    assert_eq!(names.len(), 245);
     assert!(
         mcp.call("tools/list", json!({"cursor":"invalid"}))
             .get("error")
@@ -10025,39 +8072,45 @@ fn content_provider_calls_preserve_selections_job_locations_and_conditions() {
 }
 
 #[test]
-fn content_selection_mcp_preserves_queued_work_and_stale_write_error() {
-    let body = json!({"object_type":"CONTENT_SELECTION_UPDATE", "configuration":{"path_filters":[]}, "scheduled_imports":[{"id":"rim_example", "status":"QUEUED"}]});
+fn content_selection_mcp_preserves_updated_integration_and_stale_write_error() {
+    let body = json!({"object_type":"PROJECT_STORYBLOK_INTEGRATION", "id":"pr_example", "path_filters":[], "connection_status":"CONNECTED"});
     let problem = json!({"status":412, "code":"precondition_failed", "request_id":"content-selection"});
     let stub = Stub::new(vec![
-        response("200 OK", body.clone(), ""),
+        response("200 OK", body.clone(), "ETag: \"selection-after\"\r\n"),
         response("412 Precondition Failed", problem.clone(), ""),
     ]);
     let mut mcp = McpProcess::new(
         &stub.origin,
-        &["--operation", "setProjectStoryblokSelectionSettings"],
+        &["--operation", "updateProjectStoryblokIntegration"],
     );
     let catalog = mcp.call("tools/list", json!({}));
     let tool = &catalog["result"]["tools"][0];
     assert_eq!(
-        tool["inputSchema"]["$defs"]["SetContentSelectionSettings"]["properties"]["path_filters"]["type"],
+        tool["inputSchema"]["$defs"]["UpdateContentIntegration"]["properties"]["path_filters"]["type"],
         "array"
     );
     let arguments = json!({"path":{"projectId":"pr_example"},"body":{"path_filters":[]},"headers":{"If-Match":"\"selection-before\""}});
     let updated = mcp.call("tools/call", json!({"name":tool["name"], "arguments":arguments}));
     assert_eq!(updated["result"]["isError"], false);
     assert_eq!(updated["result"]["structuredContent"]["body"], body);
+    assert_eq!(
+        updated["result"]["structuredContent"]["headers"]["etag"],
+        "\"selection-after\""
+    );
     let stale = mcp.call("tools/call", json!({"name":tool["name"], "arguments":arguments}));
     assert_eq!(stale["result"]["isError"], true);
     assert_eq!(stale["result"]["structuredContent"]["problem"], problem);
     let requests = stub.finish();
     assert_eq!(requests.len(), 2);
-    assert!(
-        requests[0].starts_with("PUT /v2/projects/pr_example/integrations/storyblok/selection-settings ")
-    );
+    assert!(requests[0].starts_with("PATCH /v2/projects/pr_example/integrations/storyblok "));
     assert!(
         requests[0]
             .to_lowercase()
             .contains("if-match: \"selection-before\"")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap(),
+        json!({"path_filters":[]})
     );
 }
 
@@ -10182,7 +8235,7 @@ fn authentication_lifecycle_preserves_conditional_headers_and_write_only_credent
             input["username"] = json!("agent@example.com");
         }
         if provider == "CRISP_HELPDESK" {
-            input = json!({"provider":provider,"identifier":"plugin","key":"rotation-secret","website_key":"site","signing_secret":null});
+            input = json!({"provider":provider,"identifier":"plugin","key":"rotation-secret","website_key":"site"});
         }
         let metadata =
             json!({"object_type":"INTEGRATION_AUTHENTICATION","id":"iau_test","name":"Build credentials"});
@@ -10310,8 +8363,8 @@ fn contentful_discovery_preserves_selection_external_keys_and_opaque_cursors() {
 }
 
 #[test]
-fn hubspot_content_type_configuration_preserves_conditional_replacement() {
-    let value = json!({"object_type":"HUBSPOT_CONTENT_TYPE_SETTINGS", "id":"pr_test", "enabled_content_types":["SITE_PAGE", "BLOG_POST"]});
+fn hubspot_content_type_configuration_preserves_conditional_patch() {
+    let value = json!({"object_type":"PROJECT_HUBSPOT_INTEGRATION", "id":"pr_test", "enabled_content_types":["SITE_PAGE", "BLOG_POST"], "path_filters":[], "is_publish_on_push":false});
     let stub = Stub::new(vec![
         response("200 OK", value.clone(), "ETag: \"categories\"\r\n"),
         response("200 OK", value.clone(), ""),
@@ -10322,7 +8375,7 @@ fn hubspot_content_type_configuration_preserves_conditional_replacement() {
             "--json",
             "api",
             "call",
-            "getProjectHubSpotContentTypeSettings",
+            "getProjectHubSpotIntegration",
             "--path",
             "projectId=pr_test",
         ],
@@ -10336,7 +8389,7 @@ fn hubspot_content_type_configuration_preserves_conditional_replacement() {
             "--json",
             "api",
             "call",
-            "setProjectHubSpotContentTypeSettings",
+            "updateProjectHubSpotIntegration",
             "--path",
             "projectId=pr_test",
             "--if-match",
@@ -10349,8 +8402,8 @@ fn hubspot_content_type_configuration_preserves_conditional_replacement() {
     assert_eq!(success(&result), value);
     let requests = stub.finish();
     assert_eq!(requests.len(), 2);
-    assert!(requests[0].starts_with("GET /v2/projects/pr_test/integrations/hubspot/content-type-settings "));
-    assert!(requests[1].starts_with("PUT /v2/projects/pr_test/integrations/hubspot/content-type-settings "));
+    assert!(requests[0].starts_with("GET /v2/projects/pr_test/integrations/hubspot "));
+    assert!(requests[1].starts_with("PATCH /v2/projects/pr_test/integrations/hubspot "));
     assert!(requests[1].to_lowercase().contains("if-match: \"categories\""));
     assert_eq!(requests[1].split_once("\r\n\r\n").unwrap().1, body);
 }
@@ -10519,10 +8572,10 @@ fn configuration_replacements_preserve_nested_bodies_and_conditions() {
             json!({"rules":[]}),
         ),
         (
-            "setProjectFormatSettings",
+            "setBackupSettings",
             "projectId=pr_id",
-            "/v2/projects/pr_id/format-settings",
-            json!({"configuration":{"file":{"general":{"charset":"UTF_8","file_name_languages":"ALL","is_source_used_when_missing":false,"comment_languages":"SOURCE","indentation":0,"is_final_newline_enabled":true},"json":{"is_array_indentation_enabled":true,"is_plural_order_alphabetical":false}}}}),
+            "/v2/projects/pr_id/backup-settings",
+            json!({"branch_ids":["prb_id"],"schedule":{"period":"WEEKLY","time":"03:30","day_of_week":"MONDAY"}}),
         ),
     ];
     for (operation, parameter, path, body) in payloads {
@@ -10957,7 +9010,7 @@ fn all_pages_stops_endless_distinct_cursors_at_the_page_bound() {
 }
 
 #[test]
-fn mcp_exclusive_bounds_are_numeric_in_offline_and_stdio_highlight_tools() {
+fn mcp_pixel_bounds_stay_inclusive_integers_in_offline_and_stdio_highlight_tools() {
     let operation = "attachContextImage";
     let catalog = success(&command(
         "http://127.0.0.1:1",
@@ -10967,19 +9020,24 @@ fn mcp_exclusive_bounds_are_numeric_in_offline_and_stdio_highlight_tools() {
     let mut mcp = McpProcess::new("http://127.0.0.1:1", &["--operation", operation]);
     let reply = mcp.call("tools/list", json!({}));
     for tool in [&catalog["tools"][0], &reply["result"]["tools"][0]] {
-        let fields = &tool["inputSchema"]["$defs"]["SetContextImageHighlightBox"]["properties"];
-        for field in ["width", "height"] {
-            assert_eq!(fields[field]["exclusiveMinimum"], json!(0));
-            assert!(fields[field].get("minimum").is_none());
-        }
-        for field in ["left", "top"] {
-            assert_eq!(fields[field]["minimum"], json!(0));
+        let definitions = &tool["inputSchema"]["$defs"];
+        let fields = &definitions["ContextImageHighlightBox"]["properties"];
+        for (field, minimum) in [("left", 0), ("top", 0), ("width", 1), ("height", 1)] {
+            assert_eq!(fields[field]["type"], "integer");
+            assert_eq!(fields[field]["minimum"], json!(minimum));
             assert!(fields[field].get("exclusiveMinimum").is_none());
-        }
-        for field in ["left", "top", "width", "height"] {
-            assert_eq!(fields[field]["maximum"], json!(1));
+            assert!(fields[field].get("maximum").is_none());
             assert!(fields[field].get("exclusiveMaximum").is_none());
         }
+        // OpenAPI 3.1 null unions reach the tool schema unchanged.
+        assert_eq!(
+            definitions["AttachContextImageSegment"]["properties"]["highlight_boxes"]["type"],
+            json!(["array", "null"])
+        );
+        assert_eq!(
+            definitions["AttachContextImageSegment"]["properties"]["highlight_boxes"]["items"]["$ref"],
+            "#/$defs/ContextImageHighlightBox"
+        );
     }
 }
 

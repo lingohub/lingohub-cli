@@ -194,25 +194,16 @@ fn build(spec: &Value, all: bool, operations: &[String], tags: &[String]) -> Res
     )
 }
 
-fn object<'a>(spec: &'a Value, mut value: &'a Value) -> Result<&'a Value, Error> {
-    let mut seen = BTreeSet::new();
-    while let Some(reference) = value.get("$ref").and_then(Value::as_str) {
-        if !seen.insert(reference) {
-            return Err(invalid("Cyclic operation reference"));
-        }
-        value = reference
-            .strip_prefix('#')
-            .filter(|p| p.starts_with('/'))
-            .and_then(|p| spec.pointer(p))
-            .ok_or_else(|| invalid("Unresolved or external operation reference"))?;
-    }
-    value
-        .as_object()
-        .ok_or_else(|| invalid("Expected an OpenAPI object"))?;
-    Ok(value)
+/// Resolve shared request bodies and parameters through the contract's reference helper.
+fn object<'a>(spec: &'a Value, value: &'a Value) -> Result<&'a Value, Error> {
+    contract::dereference(spec, value)
+        .filter(|value| value.is_object())
+        .ok_or_else(|| invalid("Unresolved, cyclic or external operation reference"))
 }
 
 /// Keep recursive schemas finite with tool-local definitions, without dropping nullability/facets.
+/// OpenAPI 3.1 null types (`type: [T, "null"]`, `oneOf: [$ref, null]`) and `$ref` siblings are
+/// already JSON Schema 2020-12 and pass through; the OpenAPI 3.0 keywords are still converted.
 fn schema_refs(spec: &Value, value: &Value, definitions: &mut Map<String, Value>) -> Result<Value, Error> {
     match value {
         Value::Object(properties) => {
@@ -322,14 +313,14 @@ mod tests {
                 .iter()
                 .all(|tool| tool["annotations"]["readOnlyHint"] == true)
         );
-        assert_eq!(309, first["available_operation_count"]);
+        assert_eq!(247, first["available_operation_count"]);
     }
 
     #[test]
     fn complete_inventory_accounts_for_every_operation_and_resolves_input_references() {
         let result = catalog(true, &[], &[]).unwrap();
         assert_eq!(
-            309,
+            247,
             result["tools"].as_array().unwrap().len() + result["unsupported"].as_array().unwrap().len()
         );
         for tool in result["tools"].as_array().unwrap() {
@@ -370,9 +361,9 @@ mod tests {
 
     #[test]
     fn conditional_replacement_preserves_required_body_public_enum_and_header() {
-        let result = catalog(false, &["setProjectKeySettings".into()], &[]).unwrap();
+        let result = catalog(false, &["setBackupSettings".into()], &[]).unwrap();
         let tool = &result["tools"][0];
-        assert_eq!("project_settings.setProjectKeySettings", tool["name"]);
+        assert_eq!("backup_settings.setBackupSettings", tool["name"]);
         assert_eq!(false, tool["annotations"]["readOnlyHint"]);
         assert_eq!(json!(["path", "body"]), tool["inputSchema"]["required"]);
         assert_eq!(
@@ -384,9 +375,14 @@ mod tests {
                 .get("If-Match")
                 .is_some()
         );
+        let definitions = &tool["inputSchema"]["$defs"];
         assert_eq!(
-            json!(["normalization_strategy"]),
-            tool["inputSchema"]["$defs"]["SetProjectKeySettings"]["required"]
+            json!(["branch_ids", "schedule"]),
+            definitions["SetBackupSettings"]["required"]
+        );
+        assert_eq!(
+            json!(["DAILY", "WEEKLY"]),
+            definitions["BackupSchedulePeriod"]["enum"]
         );
     }
 
@@ -421,6 +417,30 @@ mod tests {
     #[test]
     fn nullable_inputs_allow_null_without_weakening_non_null_constraints() {
         let spec = json!({"components":{"schemas":{"Choice":{"type":"string","enum":["A","B"]}}}});
+        // OpenAPI 3.1 forms are JSON Schema 2020-12 already; only references are rewritten.
+        for (original, expected) in [
+            (
+                json!({"type":["string","null"],"minLength":1}),
+                json!({"type":["string","null"],"minLength":1}),
+            ),
+            (
+                json!({"oneOf":[{"$ref":"#/components/schemas/Choice"},{"type":"null"}],"description":"Optional choice"}),
+                json!({"oneOf":[{"$ref":"#/$defs/Choice"},{"type":"null"}],"description":"Optional choice"}),
+            ),
+            (
+                json!({"$ref":"#/components/schemas/Choice","description":"Sibling","example":"A"}),
+                json!({"$ref":"#/$defs/Choice","description":"Sibling","examples":["A"]}),
+            ),
+        ] {
+            let mut definitions = Map::new();
+            assert_eq!(expected, schema_refs(&spec, &original, &mut definitions).unwrap());
+            if expected.to_string().contains("#/$defs/Choice") {
+                assert_eq!(json!(["A", "B"]), definitions["Choice"]["enum"]);
+            } else {
+                assert!(definitions.is_empty());
+            }
+        }
+        // The OpenAPI 3.0 keyword is still converted, should an older contract be bundled.
         for original in [
             json!({"nullable":true,"type":"string","minLength":1}),
             json!({"nullable":true,"oneOf":[{"$ref":"#/components/schemas/Choice"}]}),
@@ -438,10 +458,53 @@ mod tests {
         assert!(converted.get("example").is_none());
         assert_eq!(converted["properties"], original["properties"]);
         assert_eq!(converted["default"], original["default"]);
-        let result = catalog(false, &["setProjectFormatSettings".into()], &[]).unwrap();
-        let configuration = &result["tools"][0]["inputSchema"]["$defs"]["SetProjectFormatSettings"]["properties"]
-            ["configuration"];
-        assert_eq!(json!({"type":"null"}), configuration["anyOf"][1]);
+        let result = catalog(false, &["updateProjectSettings".into()], &[]).unwrap();
+        let definitions = &result["tools"][0]["inputSchema"]["$defs"];
+        assert_eq!(
+            json!([{"$ref":"#/$defs/UpdateProjectFormatSettings"},{"type":"null"}]),
+            definitions["UpdateProjectSettings"]["properties"]["format"]["oneOf"]
+        );
+        let result = catalog(false, &["updateSegment".into()], &[]).unwrap();
+        assert_eq!(
+            json!(["boolean", "null"]),
+            result["tools"][0]["inputSchema"]["$defs"]["UpdateSegmentText"]["properties"]["is_minor_update"]
+                ["type"]
+        );
+    }
+
+    #[test]
+    fn no_bundled_tool_schema_keeps_openapi_only_nullability_or_dangling_references() {
+        let result = catalog(true, &[], &[]).unwrap();
+        fn walk(value: &Value, in_schema_map: bool) {
+            match value {
+                Value::Object(map) => {
+                    for (key, child) in map {
+                        if matches!(
+                            key.as_str(),
+                            "example" | "examples" | "default" | "enum" | "const"
+                        ) {
+                            continue;
+                        }
+                        assert!(
+                            in_schema_map || key != "nullable",
+                            "OpenAPI 3.0 nullable keyword reached an MCP schema"
+                        );
+                        if key == "$ref" {
+                            assert!(child.as_str().unwrap().starts_with("#/$defs/"));
+                        }
+                        walk(
+                            child,
+                            !in_schema_map && matches!(key.as_str(), "properties" | "$defs"),
+                        );
+                    }
+                }
+                Value::Array(values) => values.iter().for_each(|child| walk(child, false)),
+                _ => {}
+            }
+        }
+        for tool in result["tools"].as_array().unwrap() {
+            walk(&tool["inputSchema"], false);
+        }
     }
 
     #[test]

@@ -26,7 +26,12 @@ pub async fn run(
         ));
     }
     let (parameter, object_type, status_field, status_schema) = match operation {
-        "getLinaExecution" => ("executionId", "LINA_EXECUTION", "status", "LinaExecutionStatus"),
+        "getLinaExecution" => (
+            "linaExecutionId",
+            "LINA_EXECUTION",
+            "status",
+            "LinaExecutionStatus",
+        ),
         "getImport" => ("importId", "IMPORT", "status", "ImportStatus"),
         "getBackupRestore" => (
             "backupRestoreId",

@@ -230,6 +230,13 @@ fn group(
         .map(|(key, value)| {
             let text = if let Some(text) = value.as_str() {
                 text.to_owned()
+            } else if let Some(items) = value
+                .as_array()
+                .filter(|_| typed && is_array(&schema["properties"][name]["properties"][key]))
+            {
+                form_list(items).ok_or_else(|| {
+                    Error::Input(format!("{name}.{key} must list plain values without commas"))
+                })?
             } else if typed && !value.is_null() {
                 value.to_string()
             } else {
@@ -238,4 +245,27 @@ fn group(
             Ok((key.clone(), text))
         })
         .collect()
+}
+
+/// Whether the parameter is declared as an array, as opposed to JSON content such as `filter`.
+fn is_array(schema: &Value) -> bool {
+    match &schema["type"] {
+        Value::String(kind) => kind == "array",
+        Value::Array(kinds) => kinds.iter().any(|kind| kind == "array"),
+        _ => false,
+    }
+}
+
+/// The contract's array query parameters are `style: form, explode: false`: one comma-separated
+/// value. A comma inside an item would change the list, so it is refused.
+fn form_list(items: &[Value]) -> Option<String> {
+    items
+        .iter()
+        .map(|item| match item {
+            Value::String(text) if !text.contains(',') => Some(text.clone()),
+            Value::Number(_) | Value::Bool(_) => Some(item.to_string()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|items| items.join(","))
 }
