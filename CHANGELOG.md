@@ -2,7 +2,7 @@
 
 All notable changes to the LingoHub CLI. Versions follow [semantic versioning](https://semver.org).
 
-## Unreleased
+## 0.3.0 - 2026-11-17
 
 - The bundled API V2 contract matches the current API (OpenAPI 3.1, 247 operations). API V2 is
   in beta and this sync removes and renames operations:
