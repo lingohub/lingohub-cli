@@ -2,6 +2,16 @@
 
 All notable changes to the LingoHub CLI. Versions follow [semantic versioning](https://semver.org).
 
+## Unreleased
+
+- The bundled API V2 contract matches the deployed API again. No operation, field or request
+  shape changed:
+  - `PATCH` and `PUT` operations document the `413` answer to a body over 25 MiB, as `POST`
+    operations already did
+  - Corrected descriptions: the `If-Match`, `Idempotency-Key` and rate-limit headers, the
+    language-specific style guide settings (which languages accept them) and a stack's `lina_id`,
+    which needs the stack's languages management permission
+
 ## 0.3.0 - 2026-11-17
 
 - The bundled API V2 contract matches the current API (OpenAPI 3.1, 247 operations). API V2 is
